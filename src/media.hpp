@@ -123,6 +123,8 @@ static const PayloadType G711U = get_g711u_traits();
 static const PayloadType RFC2833 = get_rfc2833_traits();
 static const PayloadType L16 = get_l16_traits();
 
+static const PayloadType Payloads[] = {G711A, G711U, RFC2833, L16};
+
 struct Packet : boost::noncopyable {
   posix_time::ptime const& timestamp() const { return timestamp_; }
   posix_time::time_duration const& duration() const { return duration_; }
@@ -305,6 +307,9 @@ Source make_source(Functor const& f) {
 
 Source mix2(Source a, Source b);
 Sink split2(Sink a, Sink b);
+
+typedef boost::function<void (Source const&)> PullSink;
+typedef boost::function<void (Sink const&)> PushSource;
 
 template<typename Decoder>
 inline
