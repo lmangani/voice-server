@@ -6,19 +6,117 @@
 namespace JSON {
 struct NullType {};
 
-const NullType null = NullType();
+inline
+bool operator != (NullType const&, NullType const&) { return false; }
+
+inline
+bool operator == (NullType, NullType) { return true; }
+
+inline
+std::ostream& operator << (std::ostream& os, NullType) { return os << "null"; }
+
+struct String : std::string {
+  String() {}
+  String(std::string const& s) : std::string(s) {}
+};
+
+inline
+std::ostream& operator << (std::ostream& os, String const& s) {
+  return os << "\"" << static_cast<std::string const&>(s) << "\"";
+}
 
 typedef boost::make_recursive_variant<
-  double,
-  std::string,
-  bool,
   NullType,
+  double,
+  String,
+  bool,
   std::map<std::string, boost::recursive_variant_>,
   std::vector<boost::recursive_variant_>
 >::type Value;
 
+static const Value null = NullType();
+
 typedef std::map<std::string, Value> Object;
 typedef std::vector<Value> Array;
+
+inline
+std::ostream& operator << (std::ostream& os, JSON::Object const& m) {
+  os << "{";
+
+  for(JSON::Object::const_iterator i = m.begin(), e = m.end();i!=e;) {
+    os << "\"" << i->first << "\":" << i->second;
+    if((++i) == e)
+      break;
+    os << ",";
+  }
+
+  return os << "}";
+}
+
+inline
+std::ostream& operator << (std::ostream& os, JSON::Array const& m) {
+  os << "[";
+
+  for(JSON::Array::const_iterator i = m.begin(), e = m.end();i!=e;) {
+    os << *i;
+    if((++i) == e)
+      break;
+    os << ",";
+  }
+
+  return os << "]";
+}
+
+inline
+Object make_object(std::string const& n, JSON::Value const& v) {
+  Object o;
+  o[n] = v;
+  return o;
+}
+
+inline
+Object make_object(std::string const& n, Value const& v,
+  std::string const& n1, Value const& v1) {
+  Object o;
+  o[n] = v;
+  o[n1] = v1;
+  return o;
+}
+
+inline
+Object make_object(std::string const& n, Value const& v,
+  std::string const& n1, Value const& v1,
+  std::string const& n2, Value const& v2) {
+  Object o;
+  o[n] = v;
+  o[n1] = v1;
+  o[n2] = v2;
+  return o;
+}
+
+inline
+Array make_array(JSON::Value const& v) {
+  Array a;
+  a.push_back(v);
+  return a;
+}
+
+inline
+Array make_array(JSON::Value const& v, JSON::Value const& v1) {
+  Array a;
+  a.push_back(v);
+  a.push_back(v1);
+  return a;
+}
+
+inline
+Array make_array(JSON::Value const& v, JSON::Value const& v1, JSON::Value const& v2) {
+  Array a;
+  a.push_back(v);
+  a.push_back(v1);
+  a.push_back(v2);
+  return a;
+}
 
 struct Error : std::exception {
   const char* what() const throw() { return "JSON parser error"; } 
@@ -67,6 +165,14 @@ Value parseArray(char const*& b, char const* e) {
     }
     
     v.push_back(parse(b, e));
+
+    if(b == e)
+      throw Error();
+
+    if(*b == ']') {
+      ++b;
+      return v;
+    }
 
     if(*b != ',') throw Error();
     ++b;
@@ -239,4 +345,5 @@ Value parse(std::string const& s) {
   char const* b = &s[0];
   return parse(b, &s[0]+s.length());
 }
+
 }
