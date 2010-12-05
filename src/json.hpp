@@ -2,6 +2,7 @@
 #include <map>
 #include <vector>
 #include <boost/variant.hpp>
+#include <boost/noncopyable.hpp>
 
 namespace JSON {
 struct NullType {};
@@ -122,63 +123,111 @@ struct Error : std::exception {
   const char* what() const throw() { return "JSON parser error"; } 
 };
 
-Value parse(char const*& begin, char const* end);
-std::string parseString(char const*& begin, char const* end);
-
-Value parseObject(char const*& b, char const* e) {
-  std::map<std::string, Value> o;
- 
-  ++b; 
-  if(*b == '}') {
-     ++b;
-     return o;
+namespace Detail {
+struct Reader : boost::noncopyable {
+  Reader(std::istream& is) : is_(is), c_(std::istream::traits_type::eof()) {}
+  
+  Reader& operator ++ () {
+    c_ = std::istream::traits_type::eof(); 
+    return *this;
   }
- 
-  while(b != e) {
-       std::string name = parseString(b,e);
 
-    if(*b != ':') throw Error();
+  int operator * () {
+    if(c_ == std::istream::traits_type::eof() && is_)
+      c_ = is_.get();
+    return c_;
+  }
+
+  typedef void (Reader::*Dummy)();
+
+  operator Dummy() { return (operator * ()) != std::istream::traits_type::eof() ? &Reader::dummy : 0; };
+
+  void dummy() {} 
+  
+  std::istream& is_;
+  int c_;
+};
+
+Value parse(Reader&);
+std::string parse_string(Reader&);
+
+inline
+void skipws(Reader& b) {
+  for(;b && isspace(*b); ++b);
+}
+
+inline
+char token(Reader& b) {
+  skipws(b);
+  if(!b) throw Error();
+  return *b;
+}
+
+inline
+char next(Reader& b) {
+  return token(++b);
+}
+
+inline
+void assert_symbol(Reader& b, char c) {
+  if(token(b) != c) throw Error();
+}
+
+Value parse_object(Reader& b) {
+  std::map<std::string, Value> o;
+  
+  assert_symbol(b, '{');
+  if(next(b) == '}') {
     ++b;
+    return o;
+  }
+   
+  for(;;) {
+    std::string name = parse_string(b);
+    
+    if(next(b) != ':') throw Error();
+    
+    next(b);
 
-    o[name] = parse(b,e);
+    o[name] = parse(b);
+
+    skipws(b);
+    if(!b) throw Error();
 
     if(*b == '}') {
       ++b;
       return o;
     }
-    else if(*b != ',')
+    if(*b != ',')
       throw Error();
-    ++b;
-  }
 
-  throw Error();
+    next(b);
+  }
 }
 
-Value parseArray(char const*& b, char const* e) {
+Value parse_array(Reader& b) {
   std::vector<Value> v;
 
-  ++b;
-  while(b != e) {
+  assert_symbol(b, '[');
+  if(next(b) == ']') {
+    ++b;
+    return v;
+  }
+
+  for(;;) {
+    v.push_back(parse(b));
+    skipws(b);
+    if(!b) throw Error();
+
     if(*b == ']') {
       ++b;
       return v;
     }
     
-    v.push_back(parse(b, e));
-
-    if(b == e)
-      throw Error();
-
-    if(*b == ']') {
-      ++b;
-      return v;
-    }
-
     if(*b != ',') throw Error();
-    ++b;
-  }
 
-  throw Error();
+    next(b);    
+  }
 }
 
 void convert_ucs2_to_utf8(int ucs2, std::string& s) {
@@ -196,19 +245,19 @@ void convert_ucs2_to_utf8(int ucs2, std::string& s) {
   }
 }
 
-std::string parseString(char const*& b, char const* e) {
+std::string parse_string(Reader& b) {
   std::string s;
   
-  if(*b != '"') throw Error();
+  assert_symbol(b, '"');
 
-  for(++b;b != e;++b) {
+  for(++b;;++b) {
     switch(*b) {
     case '"':
       ++b;
       return s;
     case '\\':
       ++b;
-      if(b == e) throw Error();
+      if(!b) throw Error();
       switch(*b) {
       case 'b':
         s.push_back('\b');
@@ -222,22 +271,19 @@ std::string parseString(char const*& b, char const* e) {
         s.push_back('\r');
       case 't':
         s.push_back('\t');
-      case 'u':
-        if(e-b < 5)
-          throw Error();
-        else { 
+      case 'u': {
           ++b;
-          int u = 0;
-          for(int i = 0; i < 4; ++i) {
+          unsigned u = 0;
+          for(int i = 0; i < 4; ++i, ++b) {
+            if(!b) throw Error();
             u *= 16;
-            if(b[i] >= '0' && b[i] <= '9')
-              u += b[i] - '0';
-            else if(b[i] >= 'a' && b[i] <= 'f')
-              u += b[i] - 'a';
-            else if(b[i] >= 'A' && b[i] <= 'F')
-              u += b[i] - 'A';
+            if(*b >= '0' && *b <= '9')
+              u += *b - '0';
+            else if(*b >= 'a' && *b <= 'f')
+              u += *b - 'a' + 0xa;
+            else if(*b >= 'A' && *b <= 'F')
+              u += *b - 'A' + 0xa;
           }
-          b += 4;
           convert_ucs2_to_utf8(u, s);
         }
         break;
@@ -254,49 +300,51 @@ std::string parseString(char const*& b, char const* e) {
   throw Error();
 }
 
-Value parseNumber(char const*& b, char const* e) {
+Value parse_number(Reader& b) {
   double i = 0.0;
   double x = 1.0;
   double s = 1.0;
 
+  if(!b) throw Error();
+
   if(*b == '-') {
     s = -1.0;
     ++b;
-    if(e == b) throw Error();
+    if(!b) throw Error();
   }
 
   if(!isdigit(*b)) throw Error();
 
-  for(;b != e && isdigit(*b); ++b)
+  for(;b && isdigit(*b); ++b)
     i = i*10 + (*b - '0');
 
-  if(b != e) {
+  if(b) {
     if('.' == *b) {
       ++b;
-      if(e == b || !isdigit(*b)) throw Error();
-      for(double m = 0.1; b !=e && isdigit(*b); m /=10, ++b)
+      if(!b || !isdigit(*b)) throw Error();
+      for(double m = 0.1; b && isdigit(*b); m /=10, ++b)
         i += (*b - '0') * m;
     }
   }
 
-  if(b != e) {
+  if(b) {
     if(*b == 'e' || *b == 'E') {
       ++b;
-      if(e == b) throw Error();
+      if(!b) throw Error();
       
       bool se = false;
       if(*b == '+') {
         ++b;
-        if(e == b) throw Error();
+        if(!b) throw Error();
       }
       else if(*b == '-') {
         ++b;
-        if(e == b) throw Error();
+        if(!b) throw Error();
         se = true;
       }
       if(!isdigit(*b)) throw Error();
 
-      for(x=0; b!=e && isdigit(*b); ++b)
+      for(x=0; b && isdigit(*b); ++b)
         x = x*10 + (*b - '0');
       if(se) x = 1/x;
     }
@@ -305,45 +353,46 @@ Value parseNumber(char const*& b, char const* e) {
   return s*i*x;
 }
 
-bool is_literal(char const*& begin, char const* e, char const* s) {
-  char const* b = begin;
-  for(;b != e && *s != 0;)
-    if(*b != *s) return false;
-
-  begin = b;
-  return true;
+void parse_literal(Reader& b, char const* s) {
+  for(;*s;) {
+    if(!b || *b != *s) throw Error();
+    ++s;
+    ++b;
+  }
 }
 
-Value parse(char const*& b, char const* e) {
-  if(e - b == 0)
-    throw Error();
+Value parse(Reader& b) {
+  skipws(b);
 
-  if(*b == '{') {
-    return parseObject(b, e);
-  }
-  else if(*b == '[') {
-    return parseArray(b, e);
-  }
-  else if(*b == '"') {
-    return parseString(b, e);
-  }
-  else if(is_literal(b, e, "true")) {
+  if(!b) return null;
+  
+  switch(*b) {
+  case '{':
+    return parse_object(b);
+  case '[':
+    return parse_array(b);
+  case '"':
+    return parse_string(b);
+  case 't': 
+    parse_literal(b, "true");
     return true;
-  }
-  else if(is_literal(b, e, "false")) {
+  case 'f': 
+    parse_literal(b, "false");
     return false;
-  }
-  else if(is_literal(b, e, "null")) {
+  case 'n': 
+    parse_literal(b, "null");
     return null;
-  }
-  else {
-    return parseNumber(b, e);
+  default:
+    return parse_number(b);
   }
 }
 
-Value parse(std::string const& s) {
-  char const* b = &s[0];
-  return parse(b, &s[0]+s.length());
+} // Detail
+
+Value parse(std::istream& is) {
+  Detail::Reader b(is);
+  return Detail::parse(b);
 }
 
 }
+

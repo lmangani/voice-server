@@ -409,16 +409,12 @@ int main(int argc, char* argv[]) {
     g_constructors["tedetector"] = tedetector_create;
     g_constructors["jitterbuffer"] = jitterbuffer_create;
 
+    std::cout << std::boolalpha;
+
     while(std::cin) {
-      std::string s;
-      std::getline(std::cin, s);
-
-      if(s.length() == 0)
-        break;    
-    
-      JSON::Value v = JSON::parse(s);
-
-      request(boost::get<JSON::Object>(v));
+      JSON::Value v = JSON::parse(std::cin);
+      if(!(v == JSON::null))
+        request(boost::get<JSON::Object>(v));
     }
     stop_event_thread();
     //Media::stop();
