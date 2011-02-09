@@ -41,6 +41,11 @@ typedef std::map<std::string, Value> Object;
 typedef std::vector<Value> Array;
 
 inline
+bool operator != (Value const& a, Value const& b) {
+  return !(a == b);
+}
+
+inline
 std::ostream& operator << (std::ostream& os, JSON::Object const& m) {
   os << "{";
 

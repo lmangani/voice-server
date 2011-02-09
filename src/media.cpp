@@ -1,10 +1,15 @@
 #include "media.hpp"
-#include <boost/asio.hpp>
+#include <boost/detail/atomic_count.hpp>
+#include <boost/utility.hpp>
 #include <boost/bind.hpp>
-#include <boost/function.hpp>
+#include <set>
+#include <boost/asio.hpp>
 #include <boost/thread.hpp>
 
-#include <iostream>
+extern "C" {
+#include "../ilbc/iLBC_decode.h"
+#include "../ilbc/iLBC_encode.h"
+}
 
 #ifdef __MACH__
 #include <mach/mach_init.h>
@@ -13,717 +18,774 @@
 #include <mach/mach_time.h>
 #endif
 
+short alaw2linear(unsigned char);
+short ulaw2linear(unsigned char);
 unsigned char linear2ulaw(short);
 unsigned char linear2alaw(short);
 
-std::ostream& operator << (std::ostream & os, Media::PacketPtr const& p) {
-  return os << "{" << p->payload_type()->name() << ", " << p->timestamp() << "," << p->duration() << "}";
-}
-
 namespace Media {
+
+namespace asio = boost::asio;
+
 asio::io_service g_io;
 
-struct _8000HzBasedTraits : PayloadTraits {
-  posix_time::time_duration default_packet_duration() const {
-    return posix_time::milliseconds(20);
-  } 
-
-  posix_time::time_duration rtp_timestamp_to_duration(boost::uint32_t ts) const {
-    return posix_time::microseconds(125) * static_cast<int>(ts);
-  }
-
-  boost::uint32_t duration_to_rtp_timestamp(posix_time::time_duration const& duration) const {
-    return duration.total_microseconds() / 125; 
-  }
+template<typename T>
+struct RefcountedT {
+  RefcountedT() : refs_(0) {}
+  
+  boost::detail::atomic_count refs_;
 };
 
-PayloadTraits const* get_g711_traits(bool u) {
-  using namespace posix_time;
-
-  struct G711Base : _8000HzBasedTraits {
-    size_t frame_size() const { return 1; }
-    
-    time_duration frame_duration() const {
-      return microseconds(125);
-    }
-  };
-
-  static struct G711A : G711Base {
-    const char* name() const {
-      return "PCMA/8000";
-    }
-
-    void fill_silence(void* data, size_t size) const {
-      memset(data, 0xd5, size);
-    }
-  } g711a;
-
-  static struct G711B : G711Base {
-    const char* name() const {
-      return "PCMU/8000";
-    }
-
-    void fill_silence(void* data, size_t size) const {
-      memset(data, 0xff, size);
-    }
-  } g711u;
-
-  return u ? static_cast<PayloadType>(&g711u) : &g711a;
+template<typename T>
+void intrusive_ptr_add_ref(RefcountedT<T>* t) {
+  ++t->refs_;
 }
 
-PayloadTraits const* get_g711a_traits() {
-  return get_g711_traits(false);
+template<typename T>
+void intrusive_ptr_release(RefcountedT<T>* t) {
+  if(!(--t->refs_))
+    delete static_cast<T*>(t);
 }
 
-PayloadTraits const* get_g711u_traits() {
-  return get_g711_traits(true);
+posix_time::time_duration size_to_duration(Encoding enc, size_t size) {
+  switch(enc) {
+  case ilbc:
+    return posix_time::milliseconds(38 == size ? 20 : 30);
+  case linear:
+    return posix_time::microseconds(125)*(size/2);
+  default:
+    return posix_time::microseconds(125)*size;
+  }
 }
 
-PayloadTraits const* get_l16_traits() {
-  using namespace posix_time;
 
-  static struct L16 : _8000HzBasedTraits {
-    const char* name() const {
-      return "L16/8000";
-    }
-
-    size_t frame_size() const { return 2; }
-    
-    time_duration frame_duration() const {
-      return microseconds(125);
-    }
-
-    void fill_silence(void* data, size_t size) const {
-      memset(data, 0, size);
-    }
-  } l16;
-
-  return &l16;
-}
-
-struct TelephoneEvent {
-  unsigned event:8;
-  unsigned volume:6;
-  unsigned r:1;
-  unsigned e:1;
-  unsigned duration:16;
+struct Payload {
+  Payload(size_t size) : refs_(0), size_(size) {}
+  boost::detail::atomic_count refs_;
+  size_t size_;
+  char data_[0];
 };
 
-PayloadTraits const* get_rfc2833_traits() {
-  using namespace posix_time;
+boost::intrusive_ptr<Payload> make_payload(size_t size) {
+  char* data = new char[size + sizeof(Payload)]; 
+  return new(data) Payload(size);
+}
 
-  static struct TE : _8000HzBasedTraits {
-    const char* name() const {
-      return "telephone-event/8000";
-    }
+void intrusive_ptr_release(Payload* p) {
+  if(!(--p->refs_)) delete[] p;
+}
+
+void intrusive_ptr_add_ref(Payload* p) {
+  ++p->refs_;
+}
+
+struct Mixer : RefcountedT<Mixer> {
+  Mixer(Sink const& s) : sink_(s) {}
+
+  void push(Packet p) {
+    if(p.encoding_ != linear)
+      return;
     
-    time_duration frame_duration() const {
-      return microseconds(0);
+    if(packets_.empty()) {
+      packets_.push_back(p);
+    }
+    else if(p.srcid_ == packets_.front().srcid_) {
+      if(ts_.is_special()) 
+        ts_ = posix_time::microsec_clock::universal_time();
+      else
+        ts_ += packets_.front().duration_;
+
+      Packet mixed(this, linear, ts_, packets_.front().duration_);
+
+      memset(mixed.payload_->data_, 0, mixed.payload_->size_);
+
+      for(Packets::iterator i = packets_.begin(), e = packets_.end(); i != e; ++i) {
+        unsigned short *p = (unsigned short*)mixed.payload_->data_, 
+          *q = (unsigned short*)(i->payload_->data_),
+          *pe = p + mixed.payload_->size_ / sizeof(*p);
+          if(q) for(; p != pe; ++p, ++q) *p += *q;
+      }
+
+      packets_.clear();
+
+      sink_(mixed);
+    }
+    else {
+      if(p.duration_ != packets_.front().duration_) 
+        throw std::runtime_error("invalid packet length");
+      packets_.push_back(p);
+    }
+  }
+  
+  posix_time::ptime ts_;
+  typedef std::list<Packet> Packets;
+  Packets packets_;
+  Sink sink_;
+};
+
+Sink mixer(Sink const& s) {
+  return boost::bind(&Mixer::push, boost::intrusive_ptr<Mixer>(new Mixer(s)), _1);
+}
+
+
+struct Encoders {
+  Source get(Encoding e) {
+    if(!sources_[e]) {
+      Filter f = factories[e]();
+      sources_[e] = f.first;
+      sink_ = split(sink_, f.second);
     }
 
-    size_t frame_size() const { return sizeof(TelephoneEvent); }
-
-    void fill_silence(void*, size_t) const {
-      assert(0);
-    }
-  } te;
-
-  return &te;
-}
-
-PacketPtr G711aDecoder::operator()(PacketPtr const& packet) const {
-  if(packet->payload_type() != G711A)
-    return packet;
-
-
-  PacketPtr decoded = make_packet(L16, packet->timestamp(), packet->duration());
-
-  static boost::int16_t table[256] = { 
-     -5504, -5248, -6016, -5760, -4480, -4224, -4992, -4736, 
-     -7552, -7296, -8064, -7808, -6528, -6272, -7040, -6784, 
-     -2752, -2624, -3008, -2880, -2240, -2112, -2496, -2368, 
-     -3776, -3648, -4032, -3904, -3264, -3136, -3520, -3392, 
-     -22016,-20992,-24064,-23040,-17920,-16896,-19968,-18944, 
-     -30208,-29184,-32256,-31232,-26112,-25088,-28160,-27136, 
-     -11008,-10496,-12032,-11520,-8960, -8448, -9984, -9472, 
-     -15104,-14592,-16128,-15616,-13056,-12544,-14080,-13568, 
-     -344,  -328,  -376,  -360,  -280,  -264,  -312,  -296, 
-     -472,  -456,  -504,  -488,  -408,  -392,  -440,  -424, 
-     -88,   -72,   -120,  -104,  -24,   -8,    -56,   -40, 
-     -216,  -200,  -248,  -232,  -152,  -136,  -184,  -168, 
-     -1376, -1312, -1504, -1440, -1120, -1056, -1248, -1184, 
-     -1888, -1824, -2016, -1952, -1632, -1568, -1760, -1696, 
-     -688,  -656,  -752,  -720,  -560,  -528,  -624,  -592, 
-     -944,  -912,  -1008, -976,  -816,  -784,  -880,  -848, 
-      5504,  5248,  6016,  5760,  4480,  4224,  4992,  4736, 
-      7552,  7296,  8064,  7808,  6528,  6272,  7040,  6784, 
-      2752,  2624,  3008,  2880,  2240,  2112,  2496,  2368, 
-      3776,  3648,  4032,  3904,  3264,  3136,  3520,  3392, 
-      22016, 20992, 24064, 23040, 17920, 16896, 19968, 18944, 
-      30208, 29184, 32256, 31232, 26112, 25088, 28160, 27136, 
-      11008, 10496, 12032, 11520, 8960,  8448,  9984,  9472, 
-      15104, 14592, 16128, 15616, 13056, 12544, 14080, 13568, 
-      344,   328,   376,   360,   280,   264,   312,   296, 
-      472,   456,   504,   488,   408,   392,   440,   424, 
-      88,    72,   120,   104,    24,     8,    56,    40, 
-      216,   200,   248,   232,   152,   136,   184,   168, 
-      1376,  1312,  1504,  1440,  1120,  1056,  1248,  1184, 
-      1888,  1824,  2016,  1952,  1632,  1568,  1760,  1696, 
-      688,   656,   752,   720,   560,   528,   624,   592, 
-      944,   912,  1008,   976,   816,   784,   880,   848 
-  };
-
-  for(size_t i = 0; i < packet->size(); ++i) {
-    reinterpret_cast<boost::int16_t*>(decoded->samples())[i] = table[packet->samples()[i]];
+    return sources_[e];
   }
+ 
+  typedef Media::Filter (*FilterFactory)(); 
+  static FilterFactory factories[];
 
-  return decoded;
-}
+  Sink sink_;
+  Source sources_[last_encoding];
+};
+  
+Encoders::FilterFactory Encoders::factories[] = {
+  Media::identity_filter,
+  Media::pcma_encoder,
+  Media::pcmu_encoder,
+  Media::ilbc_encoder
+};
 
-PacketPtr G711uDecoder::operator()(PacketPtr const& packet) const {
-  if(packet->payload_type() != G711U)
-    return packet;
 
-  PacketPtr decoded = make_packet(L16, packet->timestamp(), packet->duration());
-
-  static boost::int16_t table[256] = { 
-    -32124,-31100,-30076,-29052,-28028,-27004,-25980,-24956, 
-    -23932,-22908,-21884,-20860,-19836,-18812,-17788,-16764, 
-    -15996,-15484,-14972,-14460,-13948,-13436,-12924,-12412, 
-    -11900,-11388,-10876,-10364, -9852, -9340, -8828, -8316, 
-     -7932, -7676, -7420, -7164, -6908, -6652, -6396, -6140, 
-     -5884, -5628, -5372, -5116, -4860, -4604, -4348, -4092, 
-     -3900, -3772, -3644, -3516, -3388, -3260, -3132, -3004, 
-     -2876, -2748, -2620, -2492, -2364, -2236, -2108, -1980, 
-     -1884, -1820, -1756, -1692, -1628, -1564, -1500, -1436, 
-     -1372, -1308, -1244, -1180, -1116, -1052,  -988,  -924, 
-      -876,  -844,  -812,  -780,  -748,  -716,  -684,  -652, 
-      -620,  -588,  -556,  -524,  -492,  -460,  -428,  -396, 
-      -372,  -356,  -340,  -324,  -308,  -292,  -276,  -260, 
-      -244,  -228,  -212,  -196,  -180,  -164,  -148,  -132, 
-      -120,  -112,  -104,   -96,   -88,   -80,   -72,   -64, 
-       -56,   -48,   -40,   -32,   -24,   -16,    -8,     0, 
-     32124, 31100, 30076, 29052, 28028, 27004, 25980, 24956, 
-     23932, 22908, 21884, 20860, 19836, 18812, 17788, 16764, 
-     15996, 15484, 14972, 14460, 13948, 13436, 12924, 12412, 
-     11900, 11388, 10876, 10364,  9852,  9340,  8828,  8316, 
-      7932,  7676,  7420,  7164,  6908,  6652,  6396,  6140, 
-      5884,  5628,  5372,  5116,  4860,  4604,  4348,  4092, 
-      3900,  3772,  3644,  3516,  3388,  3260,  3132,  3004, 
-      2876,  2748,  2620,  2492,  2364,  2236,  2108,  1980, 
-      1884,  1820,  1756,  1692,  1628,  1564,  1500,  1436, 
-      1372,  1308,  1244,  1180,  1116,  1052,   988,   924, 
-       876,   844,   812,   780,   748,   716,   684,   652, 
-       620,   588,   556,   524,   492,   460,   428,   396, 
-       372,   356,   340,   324,   308,   292,   276,   260, 
-       244,   228,   212,   196,   180,   164,   148,   132, 
-       120,   112,   104,    96,    88,    80,    72,    64, 
-        56,    48,    40,    32,    24,    16,     8,     0  
-  };
-
-  for(size_t i = 0; i < packet->size(); ++i) {
-    *reinterpret_cast<boost::int16_t*>(decoded->samples()) = table[packet->samples()[i]];
-  }
-
-  return decoded;
-}
-
-PacketPtr G711aEncoder::operator()(PacketPtr const& packet) const {
-
-  if(packet->payload_type() != L16)
-    return packet;
-
-  PacketPtr encoded = make_packet(G711A, packet->timestamp(), packet->duration());
-
-  for(size_t i = 0; i < encoded->size(); ++i) {
-    encoded->samples()[i] = linear2alaw(reinterpret_cast<boost::int16_t*>(packet->samples())[i]);
-  }
-  return encoded;
-}
-
-PacketPtr G711uEncoder::operator()(PacketPtr const& packet) const {
-  if(packet->payload_type() != L16)
-    return packet;
-
-  PacketPtr encoded = make_packet(G711U, packet->timestamp(), packet->duration());
-
-  for(size_t i = 0; i < encoded->size(); ++i) {
-    encoded->samples()[i] = linear2ulaw(reinterpret_cast<boost::int16_t*>(packet->samples())[i]);
-  }
-  return encoded;
-}
-
-Source mix2(Source a, Source b) {
-  struct Sk : Detail::SinkVTable {
-    void operator()(PacketPtr const&  p) {
-      TimerGuard tg;
-      if(p_) {
-        for(size_t i = 0; i < std::min(p->size(), p_->size()) / sizeof(boost::uint16_t); ++i) {
-          *(reinterpret_cast<boost::uint16_t*>(p_->samples()) + i) += *(reinterpret_cast<boost::uint16_t*>(p->samples())+i);
-        }
-
-        sink_(p_);
-        p_ = 0; 
+struct Adaptor : RefcountedT<Adaptor> {
+  void update() {
+    Sink sinks20[last_encoding];
+    Sink sinks30[last_encoding];
+    Sink sink;
+    
+    for(Sinks::iterator i = sinks_.begin(), e = sinks_.end(); i != e; ++i) {
+      if(is_compatible(i->second, own_)) {
+        sink = split(sink, i->first);
       }
       else {
-        p_ = p;
+        Encoding e = preferred(i->second);
+
+        switch(i->second.ptime_) {
+        case packet20ms:
+          sinks20[e] = split(i->first, sinks20[e]);
+          break;
+        case packet30ms:
+          sinks30[e] = split(i->first, sinks30[e]);
+          break;
+        case packetAny:
+          if(own_.ptime_ == packet30ms)
+            sinks30[e] = split(i->first, sinks30[e]);
+          else
+            sinks20[e] = split(i->first, sinks20[e]);
+          break;
+        }
       }
     }
 
-    Sink sink_;
-    PacketPtr p_;
-  };
-
-  struct Src : Detail::SourceVTable {
-    Src(Source a, Source b) : a_(a), b_(b), sink_(new Sk()) {}
-
-    void operator()(Sink const& s) {
-      remember_sink(s);
-      a_(sink_);
-      b_(sink_);
+    for(size_t i = 0; i < sizeof(sinks20) / sizeof(*sinks20); ++i) { 
+      if(!!sinks20[i])
+        getEncoderSource(Encoding(i), packet20ms)(sinks20[i]);
     }
 
-    void remember_sink(Sink s) {
-      static_cast<Sk*>(sink_.v_.get())->sink_ = s;
+    for(size_t i = 0; i < sizeof(sinks30) / sizeof(*sinks30); ++i) {
+      if(!!sinks30[i])
+        getEncoderSource(Encoding(i), packet30ms)(sinks30[i]);
     }
+
+    if(!!encoders_[0].first || !!encoders_[1].first) {
+      if(!!jitter_.first)
+        jitter_ = jitter();
+
+      if(!!decoder_.first) {
+        decoder_ = decoder(own_.encoding_);
+        jitter_.first(decoder_.second);
+      }
+
+      decoder_.first(split(encoders_[0].first, encoders_[1].first));
+    }
+
+    sink_ = split(sink, jitter_.second);
+  }
+
+  void push(Packet const& packet) { sink_(packet); }
   
-    Source a_;
-    Source b_;
-    Sink sink_;
-  };
+  typedef std::list<std::pair<Media::Sink, Media::Formats> > Sinks; 
+  Sinks sinks_;
 
-  return Source(new Src(a, b));
-}
-Sink split2(Sink a, Sink b) {
-  struct Sk : Detail::SinkVTable {
-    Sk(Sink a, Sink b) : a_(a), b_(b) {}
-
-    void operator()(PacketPtr const& p) {
-      a_(p);
-      b_(p);
-    }
-
-    Sink a_;
-    Sink b_;
-  };
-
-  return Sink(new Sk(a, b));
-}
-
-struct JitterBuffer : Refcounted<JitterBuffer> {
-  JitterBuffer(PayloadType pt, posix_time::time_duration const& latency) : latency_(latency), pt_(pt) {}
-
-  typedef boost::circular_buffer<PacketPtr> buffer_list_t;
+private:
+  Source getEncoderSource(Encoding e, Packetization p) {
+    std::pair<Sink, Encoders>* encoder = encoders_;
+    if(p == packet30ms) 
+      encoder = &encoders_[1];
     
-  void push(PacketPtr const& p) {
-    ensure_buffers_initialized();
-
-    if(p->payload_type() != pt_)
-      return;
-
-    if(p->timestamp() < ts_)
-      return;
-
-    if(p->timestamp() + p->duration() > buffers_.back()->timestamp() + buffers_.back()->duration())
-      return;
-
-    buffer_list_t::iterator i = buffers_.begin();
-    for(;p->timestamp() >= (*i)->timestamp()+(*i)->duration();++i);
-
-    size_t offset = duration_to_size(pt_, p->timestamp() - (*i)->timestamp());
-    size_t copy = std::min((*i)->size() - offset, p->size());
-
-    memcpy((*i)->samples() + offset, p->samples(), copy);
-      
-    for(size_t copied = copy; copied != p->size(); copied += copy) {
-      ++i;
-      copy = std::min((*i)->size(), p->size() - copied);
-      memcpy((*i)->samples(), p->samples() + copied, copy); 
+    Source s = encoder->second.get(e);
+    if(!encoder->first) {
+      Filter f = packetizer(p);
+      f.first(encoder->second.sink_);
+      encoder->first = f.second; 
     }
+
+    return s;
   }
 
-  void pull(Sink sink) {
-    ensure_buffers_initialized();
+  Sink sink_;
 
-    PacketPtr p = buffers_.front();
-    buffers_.pop_front();
-    ts_ += p->duration();
-    buffers_.push_back(make_silence_packet(pt_, buffers_.back()->timestamp() + buffers_.back()->duration()));
-    sink(p);
-  }
+  Media::Format own_;
+  
+  Media::Filter jitter_;
+  
+  Media::Filter decoder_;
 
-  void ensure_buffers_initialized() {
-    if(ts_.is_special()) {
-      int packets = ((latency_ * 2).total_milliseconds() + pt_->default_packet_duration().total_milliseconds()-1) / pt_->default_packet_duration().total_milliseconds();
-      buffers_ = boost::circular_buffer<PacketPtr>(packets);
-      ts_ = posix_time::microsec_clock::universal_time() - latency_;
-      for(int i =0; i < packets; ++i) {
-        buffers_.push_back(make_silence_packet(pt_, ts_ + pt_->default_packet_duration() * i));
-      }
-    }
-  }
-
-  boost::circular_buffer<PacketPtr> buffers_;
-  posix_time::ptime ts_;
-  posix_time::time_duration latency_;
-  PayloadType pt_;
+  std::pair<Sink, Encoders> encoders_[2];
 };
 
-std::pair<Source, Sink> make_jitter_buffer(PayloadType pt, posix_time::time_duration const& latency) {
-   boost::intrusive_ptr<JitterBuffer> p = new JitterBuffer(pt, latency);
+boost::intrusive_ptr<Adaptor> make_adaptor() { return new Adaptor(); }
 
-  return std::make_pair(
-    make_source(boost::bind(&JitterBuffer::pull, p, _1)),
-    make_sink(boost::bind(&JitterBuffer::push, p, _1)));
+Sink get_sink(boost::intrusive_ptr<Adaptor> const& a) { return boost::bind(&Adaptor::push, a, _1); }
+
+void set_sinks(boost::intrusive_ptr<Adaptor> const& a, std::list<std::pair<Sink, Formats> >& sinks) {
+  a->sinks_.splice(a->sinks_.begin(), sinks);
+  a->update();
+}
+
+void intrusive_ptr_add_ref(Adaptor* t) { intrusive_ptr_add_ref(static_cast<RefcountedT<Adaptor>*>(t)); }
+void intrusive_ptr_release(Adaptor* t) { intrusive_ptr_release(static_cast<RefcountedT<Adaptor>*>(t)); }
+
+Filter decoder(Encoding e) {
+  typedef Filter (*Factory)();
+  static Factory factories[] = {
+    identity_filter,
+    pcma_decoder,
+    pcmu_decoder,
+    ilbc_decoder
+  };
+
+  return factories[e]();
 }
 
 
-int default_payload_to_rtp(PayloadType pt) {
-  if(pt == G711A)
-    return 8;
-  else if(pt == G711U) 
-    return 0;
-  else if(pt == RFC2833) 
-    return 101;
+template<typename T>
+struct Transformer : RefcountedT<Transformer<T> > {
+  Transformer(T const& t) : t_(t) {}
 
-  return -1;
-}
-
-PayloadType default_rtp_to_payload(int pt) {
-  switch(pt) {
-  case 0:
-    return G711U;
-  case 8:
-    return G711A;
-  default:
-    return 0;
-  }
-}
-
-Rtp::Rtp() : socket_(g_io), smap_(default_payload_to_rtp), rmap_(default_rtp_to_payload) {
-  memset(&shdr_, 0, sizeof(shdr_));
-
-  socket_.open(asio::ip::udp::v4());
-
-  shdr_.seq = rand();
-  shdr_.version = 2;
-  shdr_.ssrc = rand();
-  
-  sts_ = posix_time::microsec_clock::universal_time() - posix_time::microseconds(rand());
-}
-
-void rtp_write_handler(boost::intrusive_ptr<Rtp> rtp, PacketPtr, boost::system::error_code const&, size_t) {}
-
-void Rtp::push(PacketPtr const& packet) {
-  //std::cerr << packet << ":" << posix_time::microsec_clock::universal_time() - packet->timestamp() << std::endl;
-  TimerGuard tg;
-
-  shdr_.timestamp = htonl(duration_to_rtp_timestamp(packet->payload_type(), packet->timestamp() - sts_));
-
-  shdr_.seq = htons(ntohs(shdr_.seq)+1);
-  shdr_.pt = smap_(packet->payload_type()); 
-
-  boost::array<asio::const_buffer, 2> buffers;
-  buffers[0] = asio::const_buffer(&shdr_, sizeof(shdr_));
-  buffers[1] = asio::const_buffer(packet->samples(), packet->size());
-
-  socket_.async_send(buffers, boost::bind(rtp_write_handler, boost::intrusive_ptr<Rtp>(this), packet, _1, _2));
-}
-
-void Rtp::connect(asio::ip::udp::endpoint const& ep) {
-  socket_.connect(ep);
-}
-
-void Rtp::bind(asio::ip::udp::endpoint const& ep) {
-  socket_.bind(ep);
-}
-
-void Rtp::set_sink(Sink const& sink) {
-  if(sink_.empty()) {
-    enqueue_recv();
+  void push(Packet const& packet) {
+    if(sink_) 
+      sink_(t_(packet));
+    else
+      t_(packet);
   }
 
-  sink_ = sink;
-}
-
-void Rtp::enqueue_recv() {
-  PacketPtr packet = make_packet(duration_to_size(G711A, posix_time::milliseconds(40)));
-  boost::array<asio::mutable_buffer,2> buffers;
-  buffers[0] = asio::mutable_buffer(&rhdr_, sizeof(rhdr_));
-  buffers[1] = asio::mutable_buffer(packet->samples(), packet->size());
-  socket_.async_receive(buffers, boost::bind(&Rtp::on_packet_recv, boost::intrusive_ptr<Rtp>(this), packet, _1, _2));
-}
-
-void Rtp::on_packet_recv(PacketPtr const& packet, boost::system::error_code const& ec, size_t bytes) {
-  if(bytes == 0)
-    return;
-
-  if(bytes < sizeof(rhdr_) + rhdr_.cc*sizeof(boost::uint32_t))
-    return;
-
-  PayloadType pt = rmap_(rhdr_.pt);
-
-  if(pt == 0)
-    return;
-
-  packet->size_ = bytes-sizeof(rhdr_);
-
-  if(rhdr_.cc != 0) {
-    packet->size_ -= rhdr_.cc*sizeof(boost::uint32_t);
-    memmove(packet->samples(), packet->samples()+rhdr_.cc*sizeof(boost::uint32_t), packet->size_);
+  void set_sink(Sink const& s) {
+    sink_ = s;
   }
 
-  rhdr_.timestamp = ntohl(rhdr_.timestamp);
-  rhdr_.seq = ntohs(rhdr_.seq);
+  T t_;
+  Sink sink_;
+};
 
-  if(rhdr_.ssrc != rssrc_) { //resync
-    rssrc_ = rhdr_.ssrc;
-
-    rts_ = posix_time::microsec_clock::universal_time() - rtp_timestamp_to_duration(pt, rhdr_.timestamp);  
-  }
-
-  packet->timestamp_ = rts_ + rtp_timestamp_to_duration(pt, rhdr_.timestamp);
-
-  packet->duration_ = size_to_duration(pt, packet->size_);
-
-  packet->payload_type_ = pt;
-
-  if(!!sink_) {
-    sink_(packet.get());
-    enqueue_recv();
-  }
-}
-
-void Rtp::set_source(Source const& source) {
-  if(!!puller_) {
-    puller_->stop();
-    puller_ = 0;
-  }
-
-  if(!!source) {
-    puller_ = new Detail::Puller(source, make_sink(boost::intrusive_ptr<Rtp>(this)));
-    puller_->start();
-  }
-}
-
-void Rtp::close() {
-  return socket_.close();
-}
-
-asio::ip::udp::endpoint Rtp::local_endpoint() {
-  return socket_.local_endpoint();
-}
-
-#ifndef _WIN32_WINNT
-extern asio::io_service g_file_io;
-#endif
-
-
-#ifdef _WIN32_WINNT
-FileSource::FileSource(const char* file, PayloadType pt, boost::function<void ()> const& f) : file_(g_io), pt_(pt), on_eof_(f) {
-  HANDLE h = ::CreateFileA(
-    file,
-    GENERIC_READ,
-    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-    0,
-    OPEN_EXISTING,
-    FILE_FLAG_OVERLAPPED,
-    0   
-  );
-
-  if(INVALID_HANDLE_VALUE == h)
-    throw boost::system::system_error(boost::system::error_code(::GetLastError(), boost::system::system_category));
-
-  file_.assign(h);
-}
-#else
-FileSource::FileSource(const char* file, PayloadType pt, boost::function<void ()> const& f) : file_(g_file_io), pt_(pt), on_eof_(f) {
-  int fd = open(file, O_RDONLY);
-
-  if(-1 == fd) {
-    throw boost::system::system_error(boost::system::errc::make_error_code(boost::system::errc::errc_t(errno)));
-  }
-  
-  file_.assign(fd);
-}
-#endif
-
-#ifndef _WIN32_WINNT
-void packet_read(boost::intrusive_ptr<FileSource> f, Sink const& sink, PacketPtr const& packet) {
-  asio::async_read(f->file_, asio::mutable_buffers_1(packet->samples(), packet->size()),
-    boost::bind(&FileSource::on_read_complete, f, sink, packet, _1, _2));
-}
-#endif
-
-void FileSource::pull(Sink const& sink) {
-  TimerGuard tg;
-
-  if(ts_.is_special()) {
-    ts_ = posix_time::microsec_clock::universal_time();
-#ifdef _WIN32_WINNT
-    begin_ts_ = ts_;
-#endif
-  }
-
-  boost::intrusive_ptr<Packet> packet = make_packet(pt_, ts_);
-  ts_ += packet->duration();
-
-#ifdef _WIN32_WINNT
-  asio::async_read_at(
-    file_,
-    duration_to_size(pt_, ts_ - begin_ts_),    
-    asio::mutable_buffers_1(packet->samples(), packet->size()),
-    boost::bind(&FileSource::on_read_complete, boost::intrusive_ptr<FileSource>(this), sink, packet, _1, _2));
-#else
-  g_file_io.post(boost::bind(packet_read, boost::intrusive_ptr<FileSource>(this), sink, packet));
-#endif
-}
-
-void FileSource::on_read_complete(Sink const& sink, PacketPtr const& packet, boost::system::error_code const& ec, size_t bytes) {
-  if(0 == bytes || ec) {
-    if(!on_eof_.empty())
-      on_eof_();
-  }
-  else {
-    packet->size_ = bytes;
-    packet->duration_ = size_to_duration(pt_, bytes);
-
-    sink(packet);
-  }
-}
-
-void FileSource::set_sink(Sink const& sink) {
-  if(!!puller_) {
-    puller_->stop();
-    puller_ = 0;
-  }
-
-  if(!!sink) {
-    puller_ = new Detail::Puller(make_source(boost::intrusive_ptr<FileSource>(this)), sink);
-    puller_->start();
-  }
-}
-
-void FileSource::close() {
-  file_.close();
+template<typename T>
+Filter make_transformer(T const& t) {
+  boost::intrusive_ptr<Transformer<T> > tr(new Transformer<T>(t));
+  return std::make_pair(boost::bind(&Transformer<T>::set_sink, tr, _1), boost::bind(&Transformer<T>::push, tr, _1));
 }
 
 
-#ifdef _WIN32_WINNT
-FileSink::FileSink(const char* file) : file_(g_io) {
-  HANDLE h = ::CreateFileA(
-    file,
-    GENERIC_WRITE,
-    FILE_SHARE_DELETE,
-    0,
-    CREATE_ALWAYS,
-    FILE_FLAG_OVERLAPPED,
-    0);
+template<typename T> T identity(T t) { return t; }
 
-  if(INVALID_HANDLE_VALUE == h)
-    throw boost::system::system_error(boost::system::error_code(::GetLastError(), boost::system::system_category));
-
-  file_.assign(h);
-}
-#else
-FileSink::FileSink(const char* file) : file_(g_file_io) {
-  int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-
-  if(-1 == fd) {
-    throw boost::system::system_error(boost::system::errc::make_error_code(boost::system::errc::errc_t(errno)));
-  }
-
-  file_.assign(fd);
-}
-#endif
-
-void packet_write_handler(PacketPtr const& , boost::system::error_code const&, size_t) {}
-
-#ifndef _WIN32_WINNT
-void packet_write(boost::intrusive_ptr<FileSink> f, PacketPtr const& packet) {
-  asio::async_write(f->file_, asio::const_buffers_1(packet->samples(), packet->size()), boost::bind(packet_write_handler, packet, _1, _2));
-}
-#endif
-
-void FileSink::push(PacketPtr const& packet) {
-  TimerGuard tg;
-#ifdef _WIN32_WINNT
-  if(begin_ts_.is_special())
-    begin_ts_ = packet->timestamp();
-  asio::async_write_at(
-    file_, 
-    duration_to_size(packet->payload_type(), packet->timestamp()-begin_ts_),
-    asio::const_buffers_1(packet->samples(), 
-    packet->size()),
-    boost::bind(packet_write_handler, packet, _1, _2));
-#else
-  g_file_io.post(boost::bind(packet_write, boost::intrusive_ptr<FileSink>(this), packet));
-#endif
+Filter identity_filter() {
+  return make_transformer((Packet (*)(Packet))identity);
 }
 
-void FileSink::set_source(Source const& source) {
-  if(puller_) {
-    puller_->stop();
-    puller_ = 0;
-  }
+struct Packetizer : RefcountedT<Packetizer> {
+  Packetizer(posix_time::time_duration const& goal) : goal_(goal) {}
 
-  if(!!source) {
-    puller_ = new Detail::Puller(source, make_sink(boost::intrusive_ptr<FileSink>(this)));
-    puller_->start();
-  }
-}
-
-void FileSink::close() {
-  file_.close();
-}
-
-void TelephoneEventDetector::push(PacketPtr const& packet) {
-  if(packet->payload_type() != RFC2833)
-    return;
-
-  TelephoneEvent* te = reinterpret_cast<TelephoneEvent*>(packet->samples());
-
-  // filtering non-dtmf events
-  if(te->event > 15)
-    return;
-
-  if(in_event_) {
-    if(te->event != event_ || packet->timestamp() != ts_) {
-      if(!!on_end_) on_end_(event_, ts_);
-
-      event_ = te->event;
-      ts_ = packet->timestamp();
-        
-      if(!!on_begin_) on_begin_(event_, ts_);
+  void push(Packet const& p) {
+    packets_.push_back(p);
+    Packets t;
+    posix_time::time_duration d = posix_time::milliseconds(0);
+    for(;!packets_.empty() && d < goal_ + offset_;) {
+      t.splice(t.end(), packets_, packets_.begin()); 
+      d += t.back().duration_;
     }
-    else if(te->e) {
-      if(!!on_end_) on_end_(event_, ts_);
-      in_event_ = false;
+
+    if(d >= goal_ + offset_) {
+      Packet r(t.front().srcid_, linear, t.front().ts_ + offset_, goal_, make_payload(sizeof(short) * goal_.total_microseconds()/125));
+
+      short* d = (short*)r.payload_->data_;
+      size_t offset = offset_.total_microseconds() / 125;
+      size_t n = goal_.total_microseconds() / 125;
+
+      for(; n > 0;) {
+        size_t c = t.front().payload_->size_ / 2 - offset;
+
+        if(t.front().payload_->size_ / 2 - offset >= n) {
+          c = n;
+          offset_ = posix_time::microseconds((offset + n) * 125);
+        }
+
+        memcpy(d, (short*)t.front().payload_->data_ + offset, c*2);
+        n -= c;
+        d += c;
+        offset = 0;
+        t.pop_front();
+      }
+
+      if(sink_) sink_(r);
+    }
+    else {
+      packets_.splice(packets_.begin(), t);
     }
   }
-  else { 
-    in_event_ = true;
-    event_ = te->event;
-    ts_ = packet->timestamp();
-        
-    if(!!on_begin_) on_begin_(event_, ts_);
+
+  void set_sink(Sink const& s) {
+    sink_ = s;
   }
 
-  timer_.cancel();
-  timer_.expires_from_now(posix_time::milliseconds(100));
-  timer_.async_wait(boost::bind(&TelephoneEventDetector::on_timeout, boost::intrusive_ptr<TelephoneEventDetector>(this), _1));
+  posix_time::time_duration goal_;
+
+  typedef std::list<Packet> Packets;
+  Packets packets_;
+  posix_time::time_duration offset_;
+
+  Sink sink_;
+};
+
+Filter packetizer(Packetization p) {
+  if(p == packetAny)
+    return identity_filter();
+
+  boost::intrusive_ptr<Packetizer> z(new Packetizer(posix_time::milliseconds(p)));
+  return std::make_pair(boost::bind(&Packetizer::set_sink, z, _1), boost::bind(&Packetizer::push, z, _1));
 }
 
-void TelephoneEventDetector::on_timeout(boost::system::error_code const& ec) {
-  if(!ec && in_event_) {
-    in_event_ = false;
-    if(!!on_end_) on_end_(event_, ts_);
+void splitter(Sink const& a, Sink const& b, Packet const& p) {
+  a(p);
+  b(p);
+}
+
+Sink split(Sink const& a, Sink const& b) {
+  return boost::bind(splitter, a, b, _1);
+}
+
+
+struct Jitter : RefcountedT<Jitter> {
+  Jitter(Clock const& clock) : clock_(clock) {}
+
+  void tick(posix_time::ptime const& ptime) {
+    if(delay_.is_special()) {
+      if(!packets_.empty()) {
+        delay_ = ptime - packets_.begin()->ts_ + posix_time::milliseconds(60);
+        tick(ptime);
+        return;
+      }
+    }
+    else {
+      if(!packets_.empty()) {
+        posix_time::ptime ts = packets_.begin()->ts_ + delay_;
+
+        if(ts == ptime) {
+          Packet p(*packets_.begin());
+          packets_.erase(packets_.begin());
+          p.ts_ = ptime;
+          emit(p);
+        }
+        else if(ts < ptime && ts - ptime < posix_time::milliseconds(150)) {
+          delay_ = ptime - packets_.begin()->ts_ + lastDuration_*3;
+          tick(ptime);
+          return;
+        }
+        else
+          emit(Packet(this, lastEncoding_, ptime, lastDuration_));
+      } 
+      else
+        emit(Packet(this, lastEncoding_, ptime, lastDuration_));
+    
+      clock_(ptime + lastDuration_, boost::bind(&Jitter::tick, boost::intrusive_ptr<Jitter>(this), _1));
+    }
   }
+
+  void emit(Packet const& p) {
+    if(!!sink_) sink_(p);
+  }
+
+  void push(Packet const& packet) {
+    lastEncoding_ = packet.encoding_;
+    lastDuration_ = packet.duration_;
+    packets_.insert(packet);
+  }
+
+  void set_sink(Sink const& sink) {
+    sink_ = sink;
+  }
+
+  Sink sink_;
+
+  struct OrderPackets : std::binary_function<bool, Packet, Packet> {
+    bool operator()(Packet const& a, Packet const& b) const { return a.ts_ < b.ts_; }
+  };
+
+  Clock clock_;
+  typedef std::set<Packet, OrderPackets> Packets;
+  Packets packets_;
+  posix_time::time_duration delay_;
+  Encoding lastEncoding_;
+  posix_time::time_duration lastDuration_;
+};
+
+Filter jitter(Clock const& clock) {
+  boost::intrusive_ptr<Jitter> j(new Jitter(clock));
+
+  return std::make_pair(boost::bind(&Jitter::set_sink, j, _1), boost::bind(&Jitter::push, j, _1));
 }
 
-boost::thread g_thread;
+struct SystemClock : RefcountedT<SystemClock> {
+  SystemClock() : timer_(g_io) {}
+
+  static void handler(boost::function<void (posix_time::ptime const&)> const& f, posix_time::ptime const& ts, boost::system::error_code const& error) {
+    if(!error)
+      f(ts);
+  }
+
+  void set(posix_time::ptime const& ts, boost::function<void (posix_time::ptime const&)> const& f) {
+    timer_.expires_at(ts);
+    timer_.async_wait(boost::bind(handler, f, ts, _1));
+  }
+
+  asio::deadline_timer timer_;
+}; 
+
+Clock system_clock() {
+  boost::intrusive_ptr<SystemClock> c(new SystemClock());
+  
+  return boost::bind(&SystemClock::set, c, _1, _2);
+}
+
+
+struct Rtp : RefcountedT<Rtp> {
+  Rtp() : socket_(g_io), rssrc_(0) {}
+
+  void enqueue_recv() {
+    boost::intrusive_ptr<Payload> payload = make_payload(40*8);
+    boost::array<asio::mutable_buffer,2> buffers;
+    buffers[0] = asio::mutable_buffer(&rhdr_, sizeof(rhdr_));
+    buffers[1] = asio::mutable_buffer(payload->data_, payload->size_);
+    socket_.async_receive(buffers, boost::bind(&Rtp::on_packet_recv, boost::intrusive_ptr<Rtp>(this), payload, _1, _2));
+  }
+
+  void on_packet_recv(boost::intrusive_ptr<Payload> payload, boost::system::error_code const& ec, size_t bytes) {
+    if(bytes == 0)
+      return;
+
+    if(bytes < sizeof(rhdr_) + rhdr_.cc*sizeof(boost::uint32_t))
+      return;
+    
+    rhdr_.timestamp = ntohl(rhdr_.timestamp);
+    rhdr_.seq = ntohs(rhdr_.seq);
+
+    if(rhdr_.ssrc != rssrc_) { //resync
+      rssrc_ = rhdr_.ssrc;
+
+      rts_ = posix_time::microsec_clock::universal_time() - rtp_timestamp_to_duration(rhdr_.timestamp);  
+    }
+
+    if(!!sink_) {
+      payload->size_ = bytes-sizeof(rhdr_);
+
+      if(rhdr_.cc != 0) {
+        payload->size_ -= rhdr_.cc*sizeof(boost::uint32_t);
+        memmove(payload->data_, payload->data_+rhdr_.cc*sizeof(boost::uint32_t), payload->size_);
+      }
+
+      Encoding enc = rmap_(rhdr_.pt); 
+
+      sink_(Packet(this, enc, rts_ + rtp_timestamp_to_duration(rhdr_.timestamp), size_to_duration(enc, payload->size_)));
+      enqueue_recv();
+    }
+  }
+ 
+  static posix_time::time_duration rtp_timestamp_to_duration(boost::uint32_t ts) {
+    return posix_time::microseconds(125)*ts;
+  }
+ 
+  void write_handler(Packet, boost::system::error_code const&, size_t) {}
+  
+  void push(Packet const& packet) {
+    shdr_.timestamp = htonl(duration_to_rtp_timestamp(packet.ts_ - sts_));
+
+    shdr_.seq = htons(ntohs(shdr_.seq)+1);
+    shdr_.pt = smap_(packet.encoding_); 
+
+    boost::array<asio::const_buffer, 2> buffers;
+    buffers[0] = asio::const_buffer(&shdr_, sizeof(shdr_));
+    buffers[1] = asio::const_buffer(packet.payload_->data_, packet.payload_->size_);
+
+    socket_.async_send(buffers, boost::bind(&Rtp::write_handler, boost::intrusive_ptr<Rtp>(this), packet, _1, _2));
+  }
+
+  static boost::uint32_t duration_to_rtp_timestamp(posix_time::time_duration const& d) {
+    return d.total_microseconds()/125;
+  }
+
+  void set_sink(Sink sink) {
+    std::swap(sink_, sink);
+
+    if(!sink && !!sink_)
+      enqueue_recv();
+  }
+
+  struct RtpHeader {
+    unsigned cc:4;      // CSRC count
+    unsigned x:1;       // extension flag
+    unsigned p:1;       // padding flag
+    unsigned version:2; // RTP version
+    unsigned pt:7;      // payload type
+    unsigned m:1;       // marker
+    unsigned seq:16;    // sequence number
+    boost::uint32_t timestamp;
+    boost::uint32_t ssrc;      // synchronization source
+  };
+
+  asio::ip::udp::socket socket_;
+  
+  RtpHeader rhdr_;
+  posix_time::ptime rts_;
+  boost::uint32_t rssrc_;
+  boost::function<Encoding (int)> rmap_;
+
+  Sink sink_;
+
+  RtpHeader shdr_;
+  posix_time::ptime sts_;
+  boost::function<int (Encoding)> smap_;
+};
+
+void intrusive_ptr_add_ref(Rtp* rtp) {
+  intrusive_ptr_add_ref(static_cast<RefcountedT<Rtp>*>(rtp));
+}
+
+void intrusive_ptr_release(Rtp* rtp) {
+  intrusive_ptr_release(static_cast<RefcountedT<Rtp>*>(rtp));
+}
+
+boost::intrusive_ptr<Rtp> make_rtp() {
+  return new Rtp();
+}
+
+Sink get_sink(boost::intrusive_ptr<Rtp> const& rtp) {
+  return boost::bind(&Rtp::push, rtp, _1);
+}
+
+Source get_source(boost::intrusive_ptr<Rtp> const& rtp) {
+  return boost::bind(&Rtp::set_sink, rtp, _1);
+}
+
+void set_rtp_map(boost::intrusive_ptr<Rtp> const& rtp, boost::function<Encoding (int)> const& map) {
+  rtp->rmap_ = map;
+}
+
+void set_rtp_map(boost::intrusive_ptr<Rtp> const& rtp, boost::function<int (Encoding)> const& map) {
+  rtp->smap_ = map;
+}
+
+asio::ip::udp::endpoint get_local_endpoint(boost::intrusive_ptr<Rtp> const& rtp) {
+  return rtp->socket_.local_endpoint();
+}
+
+void set_local_endpoint(boost::intrusive_ptr<Rtp> const& rtp, asio::ip::udp::endpoint const& ep) {
+  rtp->socket_.bind(ep);
+}
+
+void set_remote_endpoint(boost::intrusive_ptr<Rtp> const& rtp, asio::ip::udp::endpoint const& ep) {
+  rtp->socket_.connect(ep);
+}
+
+asio::io_service g_file_io;
+
+struct FileSource : RefcountedT<FileSource> {
+  FileSource(const char* file, Format f, boost::function<void (void)> const& eof, Clock const& clock) : 
+    clock_(clock),
+    format_(f),
+    eof_(eof),
+    fd_(g_file_io)
+  {
+    int fd = open(file, O_RDONLY);
+
+    if(-1 == fd) {
+      throw boost::system::system_error(boost::system::errc::make_error_code(boost::system::errc::errc_t(errno)));
+    }
+  
+    fd_.assign(fd);
+  }
+
+  void start() {
+    clock_(posix_time::microsec_clock::universal_time(), boost::bind(&FileSource::tick, boost::intrusive_ptr<FileSource>(this), _1));
+  }
+
+  void tick(posix_time::ptime const& ts) {
+    boost::intrusive_ptr<Payload> payload = make_payload(payload_size());
+
+    async_read(fd_, asio::mutable_buffers_1(payload->data_, payload->size_),
+      boost::bind(&FileSource::read_complete, boost::intrusive_ptr<FileSource>(this), 
+        Packet(this, format_.encoding_, ts, duration(format_.ptime_), payload), _1, _2));
+  }
+
+  void read_complete(Packet const& packet, boost::system::error_code const& ec, size_t bytes) {
+    if(ec) {
+      g_io.post(eof_);
+    }
+    else {
+      g_io.post(boost::bind(&FileSource::push_packet, boost::intrusive_ptr<FileSource>(this), packet));
+      g_io.post(boost::bind(clock_, packet.ts_ + packet.duration_, 
+        boost::function<void (posix_time::ptime const&)>(boost::bind(&FileSource::tick, boost::intrusive_ptr<FileSource>(this), _1))));
+    }
+  }
+
+  size_t payload_size() {
+    switch(format_.encoding_) {
+    case linear:
+      return format_.ptime_ == packet30ms ? 480 : 320;
+    case pcma:
+    case pcmu:
+      return format_.ptime_ == packet30ms ? 240: 160;
+    case ilbc:
+      return format_.ptime_ == packet30ms ? 50 : 38;
+    default:
+      assert(0);
+      return 160;
+    }
+  }
+
+  void push_packet(Packet const& packet) {
+    if(sink_) sink_(packet);
+  }
+
+  void set_sink(Sink const& sink) {
+    sink_ = sink;
+  }
+
+  Clock clock_;
+  Format format_;
+  boost::function<void () > eof_;
+  asio::posix::stream_descriptor fd_;
+
+  Sink sink_;
+};
+
+boost::intrusive_ptr<FileSource> make_file_source(const char* filename, Format const& fmt, boost::function<void ()> const& eof, Clock const& clock) {
+  boost::intrusive_ptr<FileSource> fs = new FileSource(filename, fmt, eof, clock);
+  fs->start();
+  return fs;
+}
+
+Source get_source(boost::intrusive_ptr<FileSource> const& fs) {
+  return boost::bind(&FileSource::set_sink, fs, _1);
+}
+
+void intrusive_ptr_add_ref(FileSource* fs) {
+  return intrusive_ptr_add_ref(static_cast<RefcountedT<FileSource>*>(fs));
+}
+
+void intrusive_ptr_release(FileSource* fs) {
+  return intrusive_ptr_release(static_cast<RefcountedT<FileSource>*>(fs));
+}
+
+Packet decode_g711(Packet const& packet, short (*decoder)(unsigned char)) {
+  Packet dcd(packet.srcid_, linear, packet.ts_, packet.duration_, make_payload(packet.duration_.total_microseconds() / 125 *2));
+  if(packet.payload_)
+    std::transform(packet.payload_->data_, packet.payload_->data_ + packet.payload_->size_, (short*)dcd.payload_->data_, decoder);
+  else
+    memset(dcd.payload_->data_, 0, dcd.payload_->size_);
+  
+  return dcd;
+} 
+
+Filter pcma_decoder() {
+  return make_transformer(boost::bind(decode_g711, _1, alaw2linear));
+}
+
+Filter pcmu_decoder() {
+  return make_transformer(boost::bind(decode_g711, _1, ulaw2linear));
+}
+
+Packet encode_g711(Packet const& packet, Encoding e, unsigned char (*encoder)(short)) {
+  Packet r(packet.srcid_, e, packet.ts_, packet.duration_);
+
+  if(packet.payload_) {
+    r.payload_ = make_payload(packet.duration_.total_microseconds() / 125);
+
+    std::transform((short*)packet.payload_->data_, (short*)(packet.payload_->data_ + packet.payload_->size_), r.payload_->data_, encoder);
+  }
+
+  return r;
+}
+
+Filter pcma_encoder() {
+  return make_transformer(boost::bind(encode_g711, _1, pcma, linear2alaw));
+}
+
+Filter pcmu_encoder() {
+  return make_transformer(boost::bind(encode_g711, _1, pcmu, linear2ulaw));
+}
+
+
+struct IlbcDecoder {
+  IlbcDecoder() {
+    initDecode(&state_, 20, 1);
+  }
+
+  Packet operator()(Packet const& p) {
+    if(p.duration_.total_milliseconds() != state_.mode)
+      initDecode(&state_, p.duration_.total_milliseconds(), 1);
+
+    float dec[240];
+    if(p.payload_)
+      iLBC_decode(dec, (unsigned char*)p.payload_->data_, &state_, 1);
+    else
+      iLBC_decode(dec, 0, &state_, 0);
+
+    Packet r(p.srcid_, linear, p.ts_, p.duration_, make_payload(state_.blockl));
+    std::copy(dec, dec + state_.blockl, r.payload_->data_);
+    return r;
+  }
+
+  iLBC_Dec_Inst_t state_;
+};
+
+Filter ilbc_decoder() {
+  return make_transformer(IlbcDecoder());
+}
+
+
+struct IlbcEncoder {
+  IlbcEncoder() {
+    initEncode(&state_, 20);
+  }
+
+  Packet operator()(Packet const& p) {
+    if(p.duration_.total_milliseconds() != state_.mode)
+      initEncode(&state_, p.duration_.total_milliseconds());
+    
+    float data[240];
+    std::copy(p.payload_->data_, p.payload_->data_ + state_.mode, data);
+
+    Packet r(p.srcid_, ilbc, p.ts_, p.duration_, make_payload(state_.mode == 30 ? 50 : 38));
+    iLBC_encode((unsigned char*)r.payload_->data_, data, &state_);
+    
+    return r;
+  }
+
+  iLBC_Enc_Inst_t state_;
+};
+
+Filter ilbc_encoder() {
+  return make_transformer(IlbcEncoder());
+}
+
 
 std::auto_ptr<asio::io_service::work> g_work;
+boost::thread g_thread;
 
 #ifdef __MACH__
 void set_realtime_priority() {
@@ -755,22 +817,8 @@ void thread_proc() {
   g_io.run();
 }
 
-//Under Mac OS X async_write sometime takes up to 200 ms. This is unacceptable in main media thread.
-//I'm pretty sure there is no such problem under Windows. Not sure about Linux though
-asio::io_service g_file_io;
-std::auto_ptr<asio::io_service::work> g_file_work;
-
-boost::thread g_file_thread;
-
 void start() {
   g_work = std::auto_ptr<asio::io_service::work>(new asio::io_service::work(g_io));
-
-#ifndef _WIN32_WINNT
-  g_file_work= std::auto_ptr<asio::io_service::work>(new asio::io_service::work(g_file_io));
-  boost::thread file(boost::bind(&asio::io_service::run, boost::ref(g_file_io)));
-  g_file_thread.swap(file);
-#endif
-
   boost::thread thread(thread_proc);
   g_thread.swap(thread);
 }
@@ -781,10 +829,4 @@ void stop() {
 }
 
 }
-
-#ifdef MEDIA_TEST
-int main(int c, char* argv[]) {
-  return 0;
-}
-#endif
 

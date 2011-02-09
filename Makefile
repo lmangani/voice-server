@@ -1,7 +1,7 @@
 CPPFLAGS=-I /opt/local/include -Wall -g
 
 vserver: media.o g711.o main.o
-	g++ media.o g711.o main.o -L/opt/local/lib -l boost_system-mt -l boost_thread-mt -l boost_date_time -o vserver
+	g++ media.o g711.o main.o -Lilbc -l ilbc -L/opt/local/lib -l boost_system-mt -l boost_thread-mt -l boost_date_time -o vserver
 
 media.o: src/media.cpp src/media.hpp
 	g++ -c $(CPPFLAGS) src/media.cpp -o media.o
