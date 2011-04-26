@@ -305,6 +305,28 @@ JSON::Value filesink_create(JSON::Array& v) {
 
   r.close_ = boost::bind(&Media::FileSink::close, fsk);
   r.push_sink_ = Media::make_sink(fsk);
+  r.pull_sink_ = boost::bind(&Media::FileSink::set_source, fsk, _1);
+
+  g_resource_map[id.str()] = r;
+
+  return id.str();
+}
+
+JSON::Value filesocket_create(JSON::Array& v) {
+  static int count = 0;
+  Resource r;
+
+  boost::intrusive_ptr<Media::FileSocket> fsk = new Media::FileSocket(get_payload_type(boost::get<JSON::String>(v.at(2))));
+  fsk->connect(boost::get<JSON::String>(v.at(1)).c_str());
+
+  std::ostringstream id;
+  id << "filesocket" << count++;
+
+  r.close_ = boost::bind(&Media::FileSocket::close, fsk);
+  r.push_sink_ = Media::make_sink(fsk);
+  r.pull_sink_ = boost::bind(&Media::FileSocket::set_source, fsk, _1);
+
+  r.pull_source_ = Media::make_source(fsk);
 
   g_resource_map[id.str()] = r;
 
@@ -406,6 +428,7 @@ int main(int argc, char* argv[]) {
     g_constructors["rtp"] = rtp_create;
     g_constructors["filesink"] = filesink_create;
     g_constructors["filesource"] = filesource_create;
+    g_constructors["filesocket"] = filesocket_create;
     g_constructors["tedetector"] = tedetector_create;
     g_constructors["jitterbuffer"] = jitterbuffer_create;
 

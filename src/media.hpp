@@ -11,6 +11,7 @@
 #include <boost/intrusive_ptr.hpp>
 #include <boost/detail/atomic_count.hpp>
 
+
 //Simpliest possible audio processing library for ip-telephony
 namespace Media {
 
@@ -553,6 +554,28 @@ struct FileSink : Refcounted<FileSink> {
 #endif
   boost::intrusive_ptr<Detail::Puller> puller_;
 };
+
+#ifndef _WIN32_WINNT
+struct FileSocket : Refcounted<FileSocket> {
+  FileSocket(PayloadType pt);
+
+  void connect(const char* path);
+  void close();
+
+  void set_source(Source const& src);
+  void push(PacketPtr const& packet);
+
+  void set_sink(Sink const& sink);
+  void pull(Sink const& sink);
+  void on_read_complete(Sink const& sink, PacketPtr const&, boost::system::error_code const&, size_t);
+  
+  asio::local::stream_protocol::socket socket_;
+  PayloadType pt_;
+  boost::intrusive_ptr<Detail::Puller> src_puller_;
+  boost::intrusive_ptr<Detail::Puller> sink_puller_;
+  posix_time::ptime ts_;
+};
+#endif
 
 struct TelephoneEventDetector : Refcounted<TelephoneEventDetector> {
   typedef boost::function<void (int, posix_time::ptime const&)> Callback;
