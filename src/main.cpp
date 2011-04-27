@@ -321,15 +321,20 @@ JSON::Value filesink_create(JSON::Array& v) {
   return id.str();
 }
 
+void file_filesocket_connected(std::string const& id, const boost::system::error_code& error) {
+  std::cout << JSON::make_object("method", std::string("filesocket"), "params",
+    JSON::make_array(id, std::string(error ? "error": "connected")), "id", JSON::null) << std::endl;
+}
+
 JSON::Value filesocket_create(JSON::Array& v) {
   static int count = 0;
   Resource r;
 
-  boost::intrusive_ptr<Media::FileSocket> fsk = new Media::FileSocket(get_payload_type(boost::get<JSON::String>(v.at(2))));
-  fsk->connect(boost::get<JSON::String>(v.at(1)).c_str());
-
   std::ostringstream id;
   id << "filesocket" << count++;
+
+  boost::intrusive_ptr<Media::FileSocket> fsk = new Media::FileSocket(get_payload_type(boost::get<JSON::String>(v.at(2))));
+  fsk->socket_.async_connect(boost::get<JSON::String>(v.at(1)).c_str(), wrap_event_callback(boost::bind(file_filesocket_connected, id.str(), _1)));
 
   r.close_ = boost::bind(&Media::FileSocket::close, fsk);
   r.push_sink_ = Media::make_sink(fsk);
