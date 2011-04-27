@@ -374,7 +374,7 @@ JSON::Value jitterbuffer_create(JSON::Array& v) {
   std::ostringstream id;
   id << "jitterbuffer" << count++;
 
-  std::pair<Media::Source,Media::Sink> p = make_jitter_buffer(Media::L16);
+  std::pair<Media::Source,Media::Sink> p = make_jitter_buffer(v.size() > 1 ? get_payload_type(boost::get<JSON::String>(v.at(1))) : Media::L16);
 
   r.push_sink_ = p.second;
   r.pull_source_ = p.first;
