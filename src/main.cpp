@@ -207,6 +207,15 @@ void request(JSON::Object& v) {
   }
 }
 
+double get_rtpmap_value(JSON::Object& rtpmap, const char* name) {
+  JSON::Object::iterator i = rtpmap.find(name);
+
+  if(rtpmap.end() != i)
+    return boost::get<double>(i->second);
+
+  return -1;
+}
+
 JSON::Value rtp_configure(boost::intrusive_ptr<Media::Rtp> rtp, JSON::Array& v) {
   JSON::Object& a = boost::get<JSON::Object>(v.at(1));
 
@@ -214,9 +223,9 @@ JSON::Value rtp_configure(boost::intrusive_ptr<Media::Rtp> rtp, JSON::Array& v) 
   if(i != a.end()) {
     JSON::Object& rtpmap = boost::get<JSON::Object>(i->second);
 
-    int alaw = boost::get<double>(rtpmap[Media::G711A->name()]);
-    int ulaw = boost::get<double>(rtpmap[Media::G711U->name()]);
-    int te = boost::get<double>(rtpmap[Media::RFC2833->name()]);
+    int alaw = get_rtpmap_value(rtpmap, Media::G711A->name());
+    int ulaw = get_rtpmap_value(rtpmap, Media::G711U->name());
+    int te = get_rtpmap_value(rtpmap, Media::RFC2833->name());
 
     rtp->set_payload_type_to_rtp_type(boost::bind(srtpmap, _1, alaw, ulaw, te));
     rtp->set_rtp_type_to_payload_type(boost::bind(irtpmap, _1, alaw, ulaw, te));
