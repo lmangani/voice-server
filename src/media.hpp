@@ -1,608 +1,651 @@
-#ifndef __S3_MEDIA_HPP__
-#define __S3_MEDIA_HPP__
+#ifndef __VS_MEDIA_HPP__
+#define __VS_MEDIA_HPP__
 
-#include <iostream>
-
+#include <queue>
+#include <algorithm>
+#include <numeric>
 #include <boost/asio.hpp>
+#include <boost/smart_ptr.hpp>
 #include <boost/bind.hpp>
-#include <boost/function.hpp>
-#include <boost/date_time/posix_time/posix_time.hpp>
-#include <boost/circular_buffer.hpp>
-#include <boost/intrusive_ptr.hpp>
-#include <boost/detail/atomic_count.hpp>
+#include <boost/bind/apply.hpp>
+#include <boost/fusion/include/at_key.hpp>
+#include <boost/tuple/tuple.hpp>
 
-//Simpliest possible audio processing library for ip-telephony
+boost::int16_t alaw2linear(boost::uint8_t);
+boost::uint8_t linear2alaw(boost::int16_t);
+boost::int16_t ulaw2linear(boost::uint8_t);
+boost::uint8_t linear2ulaw(boost::int16_t);
+
 namespace Media {
 
-template<typename T>
-struct Refcounted : boost::noncopyable {
-  Refcounted() : refs_(0) {}
-private:
-  template<typename T2>
-  friend void intrusive_ptr_add_ref(Refcounted<T2>*);
+extern boost::asio::io_service g_io;
 
-  template<typename T2>
-  friend void intrusive_ptr_release(Refcounted<T2>*);
-  boost::detail::atomic_count refs_;
+namespace Transport {
+
+struct UdpPacket {
+  UdpPacket(boost::shared_ptr<void> const& p, size_t length) : data_(p), length_(length) {}
+
+  boost::shared_ptr<void> data_;
+  size_t length_;
 };
 
-template<typename T>
-void intrusive_ptr_add_ref(Refcounted<T>* t) {
-  ++t->refs_;
-}
+struct Socket  {
+  Socket() : socket_(boost::make_shared<boost::asio::ip::udp::socket>(g_io)) {}
 
-template<typename T>
-void intrusive_ptr_release(Refcounted<T>* t) {
-  if((--t->refs_)==0)
-    delete static_cast<T*>(t);
-}
+  void operator()(UdpPacket const& p);
 
-namespace asio = boost::asio;
+  template<typename S>
+  void recv(S s) { recv(socket_, s); }
 
-extern asio::io_service g_io;
-
-namespace posix_time = boost::posix_time;
-
-#ifdef DEBUG
-struct TimerGuard {
-  TimerGuard() : ts_(posix_time::microsec_clock::universal_time()) {}
-  ~TimerGuard() {
-    posix_time::time_duration d = posix_time::microsec_clock::universal_time() - ts_;
-    if(d > posix_time::milliseconds(10)) {
-      std::cerr << "\n\n\n" << d << "\n\n\n";
-      assert(0);
+  template<typename S>
+  static void recv(boost::shared_ptr<boost::asio::ip::udp::socket> const& socket, S s) {
+    if(socket) {
+      boost::shared_ptr<void> buffer = boost::make_shared<boost::array<boost::uint8_t, 1360> >();
+      socket->async_receive(boost::asio::mutable_buffers_1(buffer.get(), 1360), boost::bind(on_recv<S>, socket, s, buffer, _1, _2));
     }
   }
 
-  posix_time::ptime ts_;
-};
-#else
-struct TimerGuard {};
-#endif
+  template<typename S>
+  static void on_recv(boost::weak_ptr<boost::asio::ip::udp::socket> const& socket, S s, boost::shared_ptr<void> const& buffer,
+    boost::system::error_code const& ec, size_t bytes)
+  {
+    if(!ec) {
+      s(UdpPacket(buffer, bytes));
+      recv(boost::shared_ptr<boost::asio::ip::udp::socket>(socket), s);
+    }
+  }
 
-struct RtpHeader {
-  unsigned cc:4;      // CSRC count
-  unsigned x:1;       // extension flag
-  unsigned p:1;       // padding flag
-  unsigned version:2; // RTP version
-  unsigned pt:7;      // payload type
-  unsigned m:1;       // marker
-  unsigned seq:16;    // sequence number
-  boost::uint32_t timestamp;
-  boost::uint32_t ssrc;      // synchronization source
+  boost::shared_ptr<boost::asio::ip::udp::socket> socket_;
 };
 
-struct PayloadTraits : boost::noncopyable {
-  virtual ~PayloadTraits() {}
-  virtual const char* name() const = 0;
-  virtual posix_time::time_duration frame_duration() const = 0;
-  virtual size_t frame_size() const = 0;
+struct RtpPacket {
+  boost::uint8_t pt_;
+  bool marker_; 
+  boost::uint16_t seq_;
+  boost::uint32_t ts_; 
+  boost::uint32_t ssrc_;
   
-  virtual posix_time::time_duration default_packet_duration() const = 0; 
-  
-  virtual posix_time::time_duration rtp_timestamp_to_duration(boost::uint32_t ts) const = 0;
-  virtual boost::uint32_t duration_to_rtp_timestamp(posix_time::time_duration const& duration) const = 0;
-
-  virtual void fill_silence(void* data, size_t size) const =0;
+  boost::shared_ptr<void> payload_;
+  boost::uint32_t length_;
 };
 
-typedef PayloadTraits const* PayloadType;
+bool parse(UdpPacket const& in, RtpPacket& out);
+bool parse(RtpPacket const& in, UdpPacket& out);
 
-inline
-size_t duration_to_size(PayloadType pt, posix_time::time_duration const& d) {
-  return d.total_microseconds() / pt->frame_duration().total_microseconds() * pt->frame_size();
+template<typename To, typename A>
+struct Parse {
+  Parse(A a) : a_(a) {}
+
+  template<typename From>
+  void operator()(From const& p) {
+    To t;
+    if(parse(p, t)) a_(t);
+  }
+
+  A a_;
+};
+
+template<typename To, typename A>
+Parse<To, A> make_parse(A const& a) {
+  return Parse<To, A>(a);
 }
 
-inline
-posix_time::time_duration size_to_duration(PayloadType pt, size_t s) {
-  return pt->frame_duration() * (s / pt->frame_size());
+template<typename F, typename A>
+struct RtpToPacket {
+  RtpToPacket(boost::uint8_t pt, A a) : pt_(pt), a_(a) {}
+
+  void operator()(RtpPacket const& p) {
+    if(p.pt_ == pt_) {
+      F f;
+      if(parse(p, f))
+        a_(f);
+    }    
+  }
+
+  boost::uint8_t pt_;
+  A a_;
+};
+
+template<typename F, typename A>
+RtpToPacket<F, A> rtp2packet(boost::uint8_t pt, A const& a) {
+  return RtpToPacket<F,A>(pt, a);
+}
+
+template<typename M, typename A>
+struct PacketToRtp {
+  PacketToRtp(M const& m, A const& a) : ssrc_(rand()), m_(m), a_(a) {}
+  
+  template<typename T>
+  void operator()(T const& t) {
+    RtpPacket p;
+    p.ssrc_ = ssrc_;
+    p.ts_ = t.ts_;
+    p.seq_ = t.seq_;
+    p.marker_ = t.marker_;
+
+    if(-1 != boost::fusion::at_key<T>(m_)) {
+      a_(p);
+    }    
+  }
+
+  boost::uint32_t ssrc_;
+  M m_;
+  A a_;
+};
+
+template<typename F, typename S = boost::asio::posix::stream_descriptor>
+struct Reader {
+  template<typename... Args>
+  Reader(Args... args) : data_(boost::make_shared<Data>(boost::ref(g_io), args...)) {}
+ 
+  struct Data {
+    template<typename... Args>
+    Data(Args... args) : s_(args...) {}
+    
+    S s_;
+    F f_;
+  };
+ 
+  F operator()() {
+    boost::asio::async_read(data_->s_, mutable_buffers(data_->f_), boost::bind(read_handler, data_, _1, _2));
+    return data_->f_;
+  }
+
+  static void read_handler(boost::shared_ptr<Data> const&, boost::system::error_code const& ec, size_t) {}
+
+  boost::shared_ptr<Data> data_;
+};
+
+template<typename S = boost::asio::posix::stream_descriptor>
+struct Writer {
+  template<typename... Args>
+  Writer(Args... args) : data_(boost::make_shared<S>(g_io, args...)) {}
+
+  template<typename F>
+  void operator()(F const& f) {
+    boost::asio::async_write(*data_, const_buffers(f), boost::bind(write_handler<F>, f, _1, _2));
+  }
+
+  template<typename F>
+  static void write_handler(F const&, boost::system::error_code const& ec, size_t) {}
+  
+  boost::shared_ptr<S> data_;
+};
+
+}
+
+namespace Audio {
+
+typedef boost::uint32_t Timestamp;
+
+template<typename Frame>
+struct Packet : Frame {
+  Packet() {}
+  Packet(Frame const& f, Timestamp ts) : Frame(f), ts_(ts) {}
+
+  Timestamp ts_;
+};
+
+
+template<size_t N>
+struct LinearFrame {
+  static const size_t duration = N;
+  boost::shared_ptr<boost::array<boost::int16_t, N> > data_;
+};
+
+
+template<size_t N>
+LinearFrame<N> operator+ (LinearFrame<N> const& a, LinearFrame<N> const& b) {
+  if(a.data_ && b.data_) {
+    LinearFrame<N> f;
+    f.data_ = boost::make_shared<boost::array<boost::int16_t,N>>();
+    boost::int16_t *fd = f.data_->begin(), * ad = a.data_->begin(), * bd = b.data_->begin(); 
+    for(size_t i = 0; i < N;++i)
+      fd[i] = ad[i] + bd[i];
+    return f;
+  }
+  else if(a.data_)
+    return a;
+
+  return b;
+}
+
+template<size_t N>
+boost::asio::const_buffers_1 empty_frame_data(LinearFrame<N>) {
+  static boost::uint16_t data[N] = {0};
+  return boost::asio::const_buffers_1(data, sizeof(data));
 } 
- 
-inline
-posix_time::time_duration default_packet_duration(PayloadType pt) {
-  return pt->default_packet_duration();
+
+template<typename F>
+boost::asio::const_buffers_1 const_buffers(F const& f) {
+  if(f.data_)
+    return boost::asio::const_buffers_1(f.data_->begin(), f.data_->size() * sizeof(*f.data_->begin()));
+  return empty_frame_data(f);
 }
 
-inline
-boost::uint32_t duration_to_rtp_timestamp(PayloadType pt, posix_time::time_duration const& d) {
-  return pt->duration_to_rtp_timestamp(d);
+template<typename F>
+boost::asio::mutable_buffers_1 mutable_buffers(F& f) {
+  return boost::asio::mutable_buffers_1(f.data_->begin(), f.data_->size() * sizeof(*f.data_->begin()));
 }
 
-inline
-posix_time::time_duration rtp_timestamp_to_duration(PayloadType pt, boost::uint32_t t) {
-  return pt->rtp_timestamp_to_duration(t);
-}
-
-PayloadTraits const* get_g711a_traits();
-PayloadTraits const* get_g711u_traits();
-PayloadTraits const* get_rfc2833_traits();
-PayloadTraits const* get_l16_traits();
-
-static const PayloadType G711A = get_g711a_traits();
-static const PayloadType G711U = get_g711u_traits();
-static const PayloadType RFC2833 = get_rfc2833_traits();
-static const PayloadType L16 = get_l16_traits();
-
-static const PayloadType Payloads[] = {G711A, G711U, RFC2833, L16};
-
-struct Packet : boost::noncopyable {
-  posix_time::ptime const& timestamp() const { return timestamp_; }
-  posix_time::time_duration const& duration() const { return duration_; }
-
-  PayloadType payload_type() const { return payload_type_; }
-
-  boost::uint8_t* samples() { return reinterpret_cast<boost::uint8_t*>(this)+sizeof(*this); }
-  size_t size() const { return size_; }
-
- 
-  posix_time::ptime timestamp_;
-  posix_time::time_duration duration_;
-
-  PayloadType payload_type_;
-
-  size_t size_;
-
-private:
-  Packet(size_t size) : size_(size), refs_(0) {}
-
-  boost::detail::atomic_count refs_;
+template<size_t N, typename A>
+struct Resizer {
+  typedef decltype((*((A*)(0)))()) FromFrame;
+  static const int M = FromFrame::duration;
   
-  friend 
-  boost::intrusive_ptr<Packet> make_packet(size_t);
+  BOOST_STATIC_ASSERT((N % M == 0 || M % N == 0));
 
-  friend
-  void intrusive_ptr_add_ref(Packet*);
+  template<size_t F, size_t T>
+  struct Up {
+    Up(A const& a) : a_(a) {}
 
-  friend
-  void intrusive_ptr_release(Packet*);
-};
-
-inline
-boost::intrusive_ptr<Packet> make_packet(size_t size) {
-  size_t alloc = size + sizeof(Packet);
-
-  void* d = new char[alloc];
-  return new(d) Packet(size);
-}
-
-inline
-void intrusive_ptr_add_ref(Packet* packet) {
-  ++packet->refs_;
-}
-
-inline
-void intrusive_ptr_release(Packet* packet) {
-  if(--(packet->refs_) == 0) {
-    packet->~Packet();
-    delete[] reinterpret_cast<char*>(packet);
-  }
-}
-
-typedef boost::intrusive_ptr<Packet> PacketPtr;
-
-inline
-PacketPtr make_packet(PayloadType pt, posix_time::ptime const& ts, posix_time::time_duration const& duration) {
-  PacketPtr p = make_packet(duration_to_size(pt, duration));
-  p->payload_type_ = pt;
-  p->timestamp_ = ts;
-  p->duration_ = duration;
-  return p;
-}
-
-inline
-PacketPtr make_packet(PayloadType pt, posix_time::ptime const& ts) {
-  return make_packet(pt, ts, pt->default_packet_duration());
-}
-
-inline
-boost::intrusive_ptr<Packet> make_silence_packet(PayloadType pt, posix_time::time_duration const& duration)
-{
-  boost::intrusive_ptr<Packet> packet = make_packet(duration_to_size(pt, duration));
-
-  packet->duration_ = duration;
-
-  packet->payload_type_ = pt;
-
-  pt->fill_silence(packet->samples(), packet->size());
-
-  return packet;
-}
-
-inline
-boost::intrusive_ptr<Packet> make_silence_packet(PayloadType pt) {
-  return make_silence_packet(pt, default_packet_duration(pt));
-}
-
-inline 
-PacketPtr make_silence_packet(PayloadType pt, posix_time::ptime const& ts) {
-  PacketPtr p = make_silence_packet(pt);
-
-  p->timestamp_ = ts;
-
-  return p;
-}
-
-namespace Detail {
-  struct SinkVTable : Refcounted<SinkVTable> {
-    virtual ~SinkVTable() {}
-
-    virtual void operator()(PacketPtr const& packet) =0;
-  };
-}
-
-struct Sink {
-  Sink() {}
-  Sink(boost::intrusive_ptr<Detail::SinkVTable> const& v) : v_(v) {}
-
-  void operator()(PacketPtr const& packet) const {
-    (*v_)(packet);
-  }
-
-  bool empty() const {
-    return !v_;
-  }
-
-  bool operator ! () const {
-    return !v_;
-  }
-
-  boost::intrusive_ptr<Detail::SinkVTable> v_;
-};
-
-template<typename Functor>
-inline
-Sink make_sink(Functor const& f) {
-  using namespace Detail;
-
-  struct VTable : SinkVTable {
-    VTable(Functor const& f) : f_(f) {}
-
-    void operator()(PacketPtr const& packet) {
-      f_(packet);
-    }
-    Functor f_;
-  };
-
-  return Sink(new VTable(f));
-}
-
-namespace Detail {
-  struct SourceVTable : Refcounted<SourceVTable> {
-    virtual ~SourceVTable() {}
-    virtual void operator()(Sink const& sink) =0;
-  };
-}
-
-struct Source {
-  Source() {}
-  Source(boost::intrusive_ptr<Detail::SourceVTable> const& v) : v_(v) {}
-
-  void operator()(Sink const& sink) {
-    (*v_)(sink);
-  }
-
-  bool empty() const { return !v_; }
-
-  bool operator!() const { return !v_; }
-
-  boost::intrusive_ptr<Detail::SourceVTable> v_;
-};
-
-template<typename Functor>
-inline
-Source make_source(Functor const& f) {
-  using namespace Detail;
-
-  struct VTable : SourceVTable {
-    VTable(Functor const& f) : f_(f) {}
-
-    void operator()(Sink const& sink) {
-      f_(sink);
-    }
-    Functor f_;
-  };
-
-  return Source(new VTable(f));
-}
-
-Source mix2(Source a, Source b);
-Sink split2(Sink a, Sink b);
-
-typedef boost::function<void (Source const&)> PullSink;
-typedef boost::function<void (Sink const&)> PushSource;
-
-template<typename Decoder>
-inline
-Source decoder(Source source);
-
-template<typename Decoder>
-Sink decoder(Sink);
-
-template<typename Encoder>
-Source encoder(Source);
-
-template<typename Encoder>
-Sink encoder(Sink);
-
-std::pair<Source, Sink> make_jitter_buffer(PayloadType pt, posix_time::time_duration const& latency = posix_time::milliseconds(50));
-
-struct Rtp;
-
-//Sink make_sink(boost::intrusive_ptr<Rtp> rtp);
-
-//void set_sink(boost::intrusive_ptr<Rtp> rtp, Sink sink);
-//void set_source(boost::intrusive_ptr<Rtp> rtp, Source source);
-
-struct FileSource;
-//Source make_source(boost::intrusive_ptr<FileSource>);
-
-struct FileSink;
-//void set_source(boost::intrusive_ptr<FileSink>, Source);
-//Sink make_sink(boost::intrusive_ptr<FileSink>);
-
-// API implementation details
-namespace Detail {
-  template<typename T>
-  struct FilterSink : public Detail::SinkVTable {
-    FilterSink(T const& t, Sink sink) : t_(t), sink_(sink) {}
-
-    void operator()(PacketPtr const& packet) {
-      sink_(t_(packet));
-    }
-
-    T t_;
-    Sink sink_;
-  };
-
-  template<typename T>
-  Sink make_filter_sink(T const& t, Sink sink) {
-    return Sink(new FilterSink<T>(t, sink));
-  }
-
-  template<typename T>
-  struct FilterSource : SourceVTable {
-    FilterSource(T const& t , Source source) :
-      source_(source), sink_(make_filter_sink(t, Sink()))
-    {}
-
-    void operator()(Sink const& sink) {
-      remember_sink(sink);
-      source_(sink_);
-    }
-
-    void remember_sink(Sink sink) {
-      static_cast<FilterSink<T>*>(sink_.v_.get())->sink_ = sink;
-    }
- 
-    Source source_;
-    Sink sink_;
-  };
-
-  template<typename Filter>
-  inline
-  Source make_filter_source(Filter f, Source source) {
-    return Source(new FilterSource<Filter>(f, source));
-  }
-
-  struct Puller : SinkVTable {
-    Puller(Source const& src, Sink const& sk) : timer_(g_io), source_(src), sink_(sk) {}
+    LinearFrame<T> operator()() {
+      LinearFrame<T> f;
+      f.data_ = boost::make_shared<boost::array<boost::int16_t, T> >();
+      for(size_t i = 0; i < T/F; ++i) {
+        LinearFrame<F> a = a_();
+        if(a.data_)
+          memcpy(f.data_.get() + i * F, a.data_.get(), sizeof(*a.data_.get()));
+        else
+          memset(f.data_.get() + i * F, 0, sizeof(*a.data_.get()));
+      }
       
-    void operator()(PacketPtr const& p) {
-      TimerGuard tg;
-      if(!!sink_) {
-        ts_ += p->duration();
-        timer_.expires_at(ts_);
-        timer_.async_wait(boost::bind(&Puller::pull, boost::intrusive_ptr<Puller>(this), _1));
-        {
-          TimerGuard tg2;
-          sink_(p);
-        }
-      }
+      return f;
     }
-
-    void pull(boost::system::error_code const& ec) {
-      TimerGuard tg;
-
-      //std::cerr << posix_time::microsec_clock::universal_time() 
-      //          << " puller " << this << " " << posix_time::microsec_clock::universal_time() - ts_ << " " << timer_.expires_at() << std::endl;
-      if(!ec && !!source_) {
-        source_(Sink(this));
-      }
-    }
-
-    void start() {
-      ts_ = posix_time::microsec_clock::universal_time();
-      source_(Sink(this));
-    }
-
-    void stop() {
-      timer_.cancel();
-      source_ = Source();
-      sink_ = Sink();
-    }
-  
-    asio::deadline_timer timer_;
-    posix_time::ptime ts_;
-    Source source_;
-    Sink sink_;
+    A a_;
   };
-}
-
-struct G711aDecoder {
-  PacketPtr operator()(PacketPtr const& packet) const;
-};
-
-struct G711aEncoder {
-  PacketPtr operator()(PacketPtr const& packet) const;
-};
-
-struct G711uDecoder {
-  PacketPtr operator()(PacketPtr const& packet) const;
-};
-
-struct G711uEncoder {
-  PacketPtr operator()(PacketPtr const& packet) const;
-};
-
-template<typename Decoder>
-inline
-Source decoder(Source source) {
-  return Detail::make_filter_source(Decoder(), source);
-}
-
-template<typename Decoder>
-inline
-Sink decoder(Sink sink) {
-  return Detail::make_filter_sink(Decoder(), sink);
-}
-
-template<typename Encoder>
-inline
-Source encoder(Source source) {
-  return Detail::make_filter_source(Encoder(), source);
-}
-
-template<typename Encoder>
-inline
-Sink encoder(Sink sink) {
-  return Detail::make_filter_sink(Encoder(), sink);
-}
-
-struct Rtp : Refcounted<Rtp> {
-  Rtp();
-
-  void set_sink(Sink const& sink);
-  void set_source(Source const& source);
-
-  void push(PacketPtr const& p);
   
-  void connect(asio::ip::udp::endpoint const& ep);
-  void bind(asio::ip::udp::endpoint const& ep);
+  template<size_t F, size_t T>
+  struct Down {
+    Down(A const& a) : a_(a), state_(0) {}
 
-  void set_payload_type_to_rtp_type(boost::function<int (PayloadType)> const& f) {
-    smap_ = f;
+    LinearFrame<T> operator()() {
+      if(0 == state_) {
+        f_ = a_();
+      }
+
+      LinearFrame<T> r;
+      r.data_ = boost::shared_ptr<boost::array<boost::int16_t,T> >(f_.data_, (boost::array<boost::int16_t,T>*)(f_.data_.get() + state_ * T));
+
+      state_ = (state_ + 1) % (F/T);
+      return r;
+    }
+  
+    A a_;
+    LinearFrame<F> f_;
+    size_t state_;
+  };
+  
+  typename boost::mpl::if_c<(N > M), Up<M, N>, Down<M, N> >::type action_;
+
+  Resizer(A const& a) : action_(a) {}
+
+  LinearFrame<N> operator()() {
+    return action_();
+  } 
+};
+
+template<int N, typename A>
+Resizer<N,A> resize(A const& a) {
+  return Resizer<N,A>(a);
+}
+
+template<typename Frame, typename Source>
+struct Decode;
+
+template<typename A>
+auto decode(A a) -> Decode<decltype(a()), A> {
+  return Decode<decltype(a()),A>(a);
+}
+
+template<typename Frame, typename Source>
+struct Encode;
+
+template<typename F, typename A>
+Encode<F, A> encode(A const& a) {
+  return Encode<F, A>(a);
+}
+
+template<typename F>
+bool parse(Transport::RtpPacket const& in, Packet<F>& out) {
+  if(in.length_ == sizeof(*out.data_)) {
+    typedef decltype(out.data_) Data;
+    out.data_ = Data(in.payload_, reinterpret_cast<decltype(&*out.data_)>(in.payload_.get()));
+    out.ts_ = in.ts_;
+    return true;
+  }
+  return false;
+}
+
+
+template<size_t N>
+struct AlawFrame {
+  static const size_t duration = N;
+
+  boost::shared_ptr<boost::array<boost::uint8_t, N> > data_;
+};
+
+template<size_t N>
+boost::asio::const_buffers_1 empty_frame_data(AlawFrame<N>) {
+  static boost::uint8_t data[0];
+  if(data[0] != 0x55) std::fill(data, data+N, 0x55);
+  return boost::asio::const_buffers_1(data,N);
+}
+
+template<size_t N, typename A>
+struct Decode<AlawFrame<N>,A> {
+  Decode(A const& a) : a_(a) {}
+
+  LinearFrame<N> operator()() {
+    AlawFrame<N> f = a_();
+    LinearFrame<N> r;
+    if(f.data_) {
+      r.data_ = boost::make_shared<boost::array<boost::int16_t, N> >();
+      std::transform(f.data_.get()->begin(), f.data_.get()->end(), r.data_->begin(), alaw2linear);
+    }
+    return r;
   }
 
-  void set_rtp_type_to_payload_type(boost::function<PayloadType (int)> const& f) {
-    rmap_ = f;
+  A a_;
+};
+
+template<size_t N, typename A>
+struct Encode<AlawFrame<N>,A> {
+  Encode(A const& a) : a_(a) {}
+
+  AlawFrame<N> operator()() {
+    LinearFrame<N> f = a_();
+    AlawFrame<N> r;
+    if(f.data_) {
+      r.data_ = boost::make_shared<boost::array<boost::uint8_t, N> >();
+      std::transform(f.data_.get()->begin(), f.data_.get()->end(), r.data_->begin(), linear2alaw);  
+    }
+    return r;
   }
 
-  asio::ip::udp::endpoint local_endpoint();
+  A a_;
+};
 
-  void close(); 
+
+template<size_t N>
+struct UlawFrame { 
+  static const size_t duration = N;
+
+  boost::shared_ptr<boost::array<boost::uint8_t, N> > data_;
+};
+
+template<size_t N>
+boost::asio::const_buffers_1 empty_frame_data(UlawFrame<N>) {
+  static boost::uint8_t data[0];
+  if(data[0] != 0x55) std::fill(data, data+N, 0xFF);
+  return boost::asio::const_buffers_1(data,N);
+}
+
+template<size_t N, typename A>
+struct Decode<UlawFrame<N>,A> {
+  Decode(A const& a) : a_(a) {}
+
+  LinearFrame<N> operator()() {
+    UlawFrame<N> f = a_();
+    LinearFrame<N> r;
+    if(f.data_) {
+      r.data_ = boost::make_shared<boost::array<boost::int16_t, N> >();
+      std::transform(f.data_.get()->begin(), f.data_.get()->end(), r.data_->begin(), ulaw2linear);
+    }
+    return r;
+  }
+
+  A a_;
+};
+
+template<size_t N, typename A>
+struct Encode<UlawFrame<N>,A> {
+  Encode(A const& a) : a_(a) {}
+
+  UlawFrame<N> operator()() {
+    LinearFrame<N> f = a_();
+    UlawFrame<N> r;
+    if(f.data_) {
+      r.data_ = boost::make_shared<boost::array<boost::uint8_t, N> >();
+      std::transform(f.data_.get()->begin(), f.data_.get()->end(), r.data_->begin(), linear2ulaw);  
+    }
+    return r;
+  }
+
+  A a_;
+};
+
+
+template<size_t N>
+struct IlbcFrame;
+
+template<>
+struct IlbcFrame<20*8> {
+  static const size_t duration = 20*8;
+  boost::shared_ptr<boost::array<boost::uint8_t, 28> > data_;
+};
+
+template<>
+struct IlbcFrame<30*8> {
+  static const size_t duration = 30*8;
+  boost::shared_ptr<boost::array<boost::uint8_t, 50> > data_;
+};
+
+template<size_t N>
+boost::asio::const_buffers_1 empty_frame_data(IlbcFrame<N>) {
+  static boost::uint8_t data[N] = {0};
+  data[N-1] = 0x80;
+  return boost::asio::const_buffers_1(data, N);
+}
+
+namespace Detail {
+struct IlbcDecoder {
+  IlbcDecoder(int mode);
+
+  void operator()(boost::uint8_t const* in, boost::int16_t* out);
+
+  boost::shared_ptr<void> state_;
+};
+
+struct IlbcEncoder {
+  IlbcEncoder(int mode);
+
+  void operator()(boost::int16_t const* in, boost::uint8_t* out);
+
+  boost::shared_ptr<void> state_;
+};
+}
+
+template<size_t N, typename A>
+struct Decode<IlbcFrame<N>, A> {
+  Decode(A const& a) : a_(a), dec_(N/8) {}
+  
+  LinearFrame<N> operator()() {
+    LinearFrame<N> r;
+    r.data_ = boost::make_shared<boost::array<boost::int16_t, LinearFrame<N>::duration> >();
+    dec_(IlbcFrame<N>(a_()).data_->begin(), r.data_->begin());
+    return r;
+  }
+  
+  A a_;
+  Detail::IlbcDecoder dec_;
+};
+
+template<size_t N, typename A>
+struct Encode<IlbcFrame<N>, A> {
+  Encode(A const& a) : a_(a), enc_(N/8) {}
+
+  IlbcFrame<N> operator()() {
+    IlbcFrame<N> r;
+    r.data_ = boost::make_shared<boost::array<boost::uint8_t, sizeof(*r.data_)>>();
+    enc_(LinearFrame<N>(a_()).data_->begin(), r.data_->begin());
+    return r;
+  }
+
+  A a_;
+  Detail::IlbcEncoder enc_;
+};
+
+
+template<typename Frame>
+struct JitterBuffer {
+  JitterBuffer() : current_(0) {}
+
+  void push(Packet<Frame> const& packet) {
+    int n = (packet.ts_ - current_) / Frame::duration;
+
+    if(abs(n) > 5) { // resync
+      n = 2; 
+      current_ = packet.ts_ - Frame::duration * n;
+      frames_.clear();
+    }
+
+    if(frames_.size() < (n + 1)) frames_.resize(n+1); 
+    frames_[n] = packet;
+  }
+
+  Frame pull() {
+    Frame f;
+
+    current_ += Frame::duration;
+
+    if(!frames_.empty()) {
+      f = frames_.front();
+      frames_.pop_front();
+    }
+
+    return f;
+  }
+
+  typedef std::deque<Frame> Frames;
+  Frames frames_;
+  Timestamp current_;
+};
+
+
+template<typename A, size_t N = 80>
+struct Mixer {
+  Mixer(A const& a) : a_(a) {}
+
+  LinearFrame<N> operator()() {
+    return std::accumulate(a_.begin(), a_.end(), LinearFrame<80>(), boost::bind(std::plus<LinearFrame<N>>(), _1, boost::bind(boost::apply<LinearFrame<N>>(),_2)));
+  }
+
+  A a_;
+};
+
+
+template<typename S>
+struct Splitter {
+  Splitter(S const& s) : s_(s) {}
+
+  template<typename T>
+  void operator()(T const& t) {
+    for_each(s_.begin(), s_.end(), boost::bind(boost::apply<void>(), _1, boost::ref(t)));
+  }
+
+  S s_;
+};
+
+template<typename S>
+struct PullBranch {
+  typedef decltype(S()(0).first) D;
+
+  PullBranch(S s) : data_(boost::make_shared<std::pair<S, size_t>>(std::make_pair(s, 0))) {}
+
+  D operator()() {
+    D d;
+    boost::tie(d, data_->second) = data_->first(data_->second+1);
+    return d;
+  }
+
+  boost::shared_ptr<std::pair<S, size_t>> data_;
+};
+
+template<typename A>
+struct PullSplitter {
+  typedef decltype((*(A*)0)()) D;
+
+  PullSplitter(A const& a) : a_(a), n_(0) {}
+
+  std::pair<D,size_t> operator()(size_t i) {
+    assert(n_ == i || (n_+1) == i);
+
+    if((n_+1)==i) {
+      d_ = a_();
+      ++n_;
+    }
+
+    return std::make_pair(d_, n_);
+  }
+
+  PullBranch<decltype(boost::bind<std::pair<D, size_t>>((PullSplitter*)0, _1))> branch() { return boost::bind(this, _1); }
+
+  A a_;
+  D d_;
+  size_t n_;
+};
+
+
+template<typename Source, typename Sink>
+struct Clock {
+  Clock(Source const& src, Sink const& sk) : timer_(boost::make_shared<boost::asio::deadline_timer>(g_io)) {
+    schedule(timer_, src, sk, boost::posix_time::microsec_clock::universal_time());
+  }
 private:
-  void on_packet_recv(PacketPtr const& packet, boost::system::error_code const& ec, size_t bytes);
-  void enqueue_recv();
+  typedef decltype ((*((Source*)(0)))()) SourceResult;
+  static const int period = SourceResult::duration;
 
-  asio::ip::udp::socket socket_;
+  static void schedule(boost::shared_ptr<boost::asio::deadline_timer> const& timer, Source const& src, Sink const& sk, boost::posix_time::ptime ts) {
+    ts += boost::posix_time::microseconds(125)*period;
+    if(timer) {
+      timer->expires_at(ts);
+      timer->async_wait(boost::bind(on_timer, timer, src, sk, ts, _1));
+    }
+  }
+
+  static void on_timer(boost::weak_ptr<boost::asio::deadline_timer> const& timer, Source& src, Sink& sk,
+    boost::posix_time::ptime const& ts,  boost::system::error_code const& ec)
+  {
+    if(!ec) {
+      schedule(boost::shared_ptr<boost::asio::deadline_timer>(timer), src, sk, ts);
+      sk(src());
+    }
+  }
+
+  boost::shared_ptr<boost::asio::deadline_timer> timer_;
+};
+
+template<typename Source,typename Sink>
+Clock<Source, Sink> clock(Source const& src, Sink const& sk) {
+  return Clock<Source, Sink>(Source(src), Sink(sk));
+}
+
+
+template<typename A>
+struct Packetizer {
+  Packetizer(A a) : a_(a) {}
+
+  template<typename T>
+  void operator()(T const&  t) {
+    a_(Packet<T>(t, ts_));
+    ts_ += T::duration;
+  }
   
-  RtpHeader shdr_;
-  posix_time::ptime sts_;
-  boost::function<int (PayloadType)> smap_;
-
-  RtpHeader rhdr_;
-  posix_time::ptime rts_;
-  boost::uint32_t rssrc_;
-  boost::function<PayloadType (int)> rmap_;
-
-  Sink sink_;
-  boost::intrusive_ptr<Detail::Puller> puller_;
+  A a_;
+  boost::uint32_t ts_;
 };
 
-struct FileSource : Refcounted<FileSource> {
-  FileSource(const char* name, PayloadType pt, boost::function<void ()> const& eof = boost::function<void ()>());
-
-  void pull(Sink const& sink);
-
-  void close();
-
-  void set_sink(Sink const& sink);
-//private:
-  void on_read_complete(Sink const& sink, PacketPtr const&, boost::system::error_code const&, size_t);
-
-#ifdef _WIN32_WINNT
-  asio::windows::random_access_handle file_;
-#else
-  asio::posix::stream_descriptor file_;
-#endif
-  PayloadType pt_;
-  boost::function<void ()> on_eof_;
-  posix_time::ptime ts_;
-
-#ifdef _WIN32_WINNT
-  posix_time::ptime begin_ts_;
-#endif
-
-  boost::intrusive_ptr<Detail::Puller> puller_;
-};
-
-struct FileSink : Refcounted<FileSink> {
-  FileSink(const char* name);
-
-  void push(PacketPtr const& packet);
-
-  void close();
-
-  void set_source(Source const& src);
-//private:
-#ifdef _WIN32_WINNT
-  asio::windows::random_access_handle file_;
-  posix_time::ptime begin_ts_;
-#else
-  asio::posix::stream_descriptor file_;
-#endif
-  boost::intrusive_ptr<Detail::Puller> puller_;
-};
-
-struct TelephoneEventDetector : Refcounted<TelephoneEventDetector> {
-  typedef boost::function<void (int, posix_time::ptime const&)> Callback;
-  
-  TelephoneEventDetector(Callback const& on_end, Callback const& on_begin = Callback()) 
-    : on_begin_(on_begin), on_end_(on_end), in_event_(false), timer_(g_io) {}
-
-  void push(PacketPtr const& packet);
-private:
-  void on_timeout(boost::system::error_code const& ec);
-
-  boost::function<void (int event, posix_time::ptime const& ts)> on_begin_;
-  boost::function<void (int event, posix_time::ptime const& ts)> on_end_;
-  
-  bool in_event_;
-  boost::uint8_t event_;
-  posix_time::ptime ts_;  
-  asio::deadline_timer timer_;
-};
-
-struct TelephoneEventGenerator : Refcounted<TelephoneEventGenerator> {
-  void set_sink();
-};
-
-template<typename T>
-inline
-void set_source(boost::intrusive_ptr<T> sk, Source src) {
-  g_io.post(boost::bind(&T::set_source, sk, src));
 }
-
-template<typename T>
-inline
-void set_sink(boost::intrusive_ptr<T> src, Sink sk) {
-  g_io.post(boost::bind(&T::set_sink, src, sk));
-}
-
-template<typename T>
-inline
-Source make_source(boost::intrusive_ptr<T> p) {
-  return make_source(boost::bind(&T::pull, p, _1));
-}
-
-template<typename T>
-inline
-Sink make_sink(boost::intrusive_ptr<T> p) {
-  return make_sink(boost::bind(&T::push, p, _1));
-}
-
 
 void start();
+void stop();
+
+template<typename F>
+void post(F f) {
+  g_io.post(f);
+}
+
 }
 
 #endif

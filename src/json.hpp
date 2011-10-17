@@ -26,6 +26,8 @@ std::ostream& operator << (std::ostream& os, String const& s) {
   return os << "\"" << static_cast<std::string const&>(s) << "\"";
 }
 
+typedef double Number;
+
 typedef boost::make_recursive_variant<
   NullType,
   double,

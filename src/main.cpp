@@ -1,191 +1,429 @@
-#include <iostream>
-#include "media.hpp"
 #include "json.hpp"
-#include <boost/thread.hpp>
+#include "media.hpp"
 
-boost::asio::io_service the_event_io;
+#include <boost/function.hpp>
+#include <boost/mpl/list.hpp>
+#include <boost/mpl/joint_view.hpp>
+#include <boost/mpl/transform_view.hpp>
+#include <boost/mpl/copy.hpp>
+#include <boost/any.hpp>
+#include <boost/bind/make_adaptable.hpp>
 
-template<typename C>
-struct EventCallback {
-  EventCallback(C const& c) : c_(c) {}
+typedef boost::mpl::list<Media::Audio::LinearFrame<80> 
+  ,Media::Audio::AlawFrame<160>
+  ,Media::Audio::AlawFrame<240>
+  ,Media::Audio::UlawFrame<160>
+  ,Media::Audio::UlawFrame<240>
+  ,Media::Audio::IlbcFrame<160>
+  ,Media::Audio::IlbcFrame<240>
+> AudioCodecs;
 
-  void operator()() {
-    the_event_io.post(c_);
+
+namespace Media { namespace Audio {
+static const char* codec_name(LinearFrame<80>*) { return "L16/8000;p=10";}
+static const char* codec_name(AlawFrame<160>*) { return "PCMA/8000;p=20";}
+static const char* codec_name(AlawFrame<240>*) { return "PCMA/8000;p=30";}
+static const char* codec_name(UlawFrame<160>*) { return "PCMU/8000;p=20";}
+static const char* codec_name(UlawFrame<240>*) { return "PCMU/8000;p=30";}
+static const char* codec_name(IlbcFrame<160>*) { return "iLBC/8000;p=20";}
+static const char* codec_name(IlbcFrame<240>*) { return "iLBC/8000;p=30";}
+}}
+
+struct ForCodecName {
+  template<typename F>
+  static void exec(boost::mpl::end<AudioCodecs>::type*, boost::mpl::end<AudioCodecs>::type*, std::string const& name, F f) {
+    throw std::runtime_error("unknown codec");
   }
 
-  template<typename A>
-  void operator()(A a) {
-    the_event_io.post(boost::bind(c_, a));
+  template<typename I, typename F>
+  static void exec(I*, boost::mpl::end<AudioCodecs>::type*, std::string const& name, F f) {
+    typedef typename boost::mpl::deref<I>::type type;
+    if(name == codec_name((type*)0)) {
+      f((type*)0);
+    }
+    else
+      exec((typename boost::mpl::next<I>::type*)0, (boost::mpl::end<AudioCodecs>::type*)0, name, f);
   }
-
-  template<typename A1, typename A2>
-  void operator()(A1 a1, A2 a2) {
-    the_event_io.post(boost::bind(c_, a1, a2));
-  }
-
-  C c_;
 };
 
-template<typename C>
-EventCallback<C> wrap_event_callback(C const& c) {
-  return EventCallback<C>(c);
+template<typename F>
+void for_codec_name(std::string const& name, F f) {
+  ForCodecName::exec((boost::mpl::begin<AudioCodecs>::type*)0, (boost::mpl::end<AudioCodecs>::type*)0, name, f);
 }
 
-void start_event_thread() {
-  boost::thread thread(boost::bind(&boost::asio::io_service::run,&the_event_io));
+typedef boost::make_variant_over<AudioCodecs> VarFrame;
+
+template<typename A>
+struct DeVar {
+  void operator()(VarFrame const& f) {
+    boost::apply_visitor(f, boost::bind(boost::ref(a_), _1));
+  }
+
+  A a_;
+};
+
+template<template<typename T> class S>
+struct Templatify {
+  template<typename T>
+  struct apply {
+      typedef S<T> type;
+  };
+};
+
+template<typename T>
+struct Sink {
+  Sink(boost::function<void (T const& t)> const& f = boost::function<void (T const& t)>()) : p_(boost::make_shared<boost::function<void (T const& t)>>(f)) {}
+
+  void operator()(T const& t) {
+    if(!p_->empty()) (*p_)(t);
+  }
+
+  boost::shared_ptr<boost::function<void (T const&)> > p_;
+};
+
+typedef boost::make_variant_over<
+  boost::mpl::transform<
+    boost::mpl::copy<
+      boost::mpl::copy<
+        AudioCodecs,
+        boost::mpl::front_inserter<
+          boost::mpl::transform<
+            AudioCodecs,
+            Templatify<Media::Audio::Packet>
+          >::type
+        >
+      >::type,
+      boost::mpl::front_inserter<
+        boost::mpl::list<
+          Media::Transport::UdpPacket,
+          Media::Transport::RtpPacket>
+      >
+    >::type,
+    Templatify<Sink>>::type
+  >::type VSink; 
+
+typedef std::map<std::string, VSink> Sinks;
+Sinks g_sinks;
+
+VSink& get_sink(JSON::Value const& id) {
+  Sinks::iterator i = g_sinks.find(boost::get<JSON::String>(id));
+
+  if(i == g_sinks.end())
+    throw std::range_error("sink");
+
+  return i->second;
 }
 
-void stop_event_thread() {
-  the_event_io.stop();
+template<typename T>
+Sink<T>& insert_sink(JSON::Value const& id) {
+  return boost::get<Sink<T> >(g_sinks.insert(std::make_pair(boost::get<JSON::String>(id), Sink<T>())).first->second);
 }
 
-Media::PayloadType irtpmap(int e, int alaw, int ulaw, int te) {
-  if(e == alaw)
-    return Media::G711A;
-  else if(e == ulaw) 
-    return Media::G711U;
-  else if(e == te)
-    return Media::RFC2833;
-
-  return 0;
+template<typename T>
+Sink<T>& set_sink(JSON::Value const& id, boost::function<void (T const&)> const& f) {
+  Sink<T>& v = insert_sink<T>(id);
+  *v.p_ = f;
+  return v;
 }
 
-int srtpmap(Media::PayloadType pt, int alaw, int ulaw, int te) {
-  if(pt == Media::G711A)
-    return alaw;
-  else if(pt == Media::G711U) 
-    return ulaw;
-  else if(pt == Media::RFC2833)
-    return te;
 
-  return -1;
-}
- 
-struct Resource {
-  Media::PullSink pull_sink_;
-  Media::Source pull_source_;
+template<typename T>
+struct Source {
+  Source() : p_(boost::make_shared<boost::function<std::pair<T, size_t> (size_t)>>()) {}
+
+  std::pair<T, size_t> operator()(size_t n) const {
+    return p_->empty() ? std::make_pair(T(),0ul) : (*p_)(n);
+  }
   
-  Media::Sink   push_sink_;
-  Media::PushSource push_source_;
+  Media::Audio::PullBranch<Source<T>> branch() const {
+    return *this;
+  }
 
-  boost::function<void()> close_;
-
-  boost::function<JSON::Value (JSON::Array&)> configure_;
+  boost::shared_ptr<boost::function<std::pair<T,size_t> (size_t)>> p_;
 };
 
-typedef std::map<std::string, Resource> ResourceMap;
-ResourceMap g_resource_map;
+typedef boost::make_variant_over<boost::mpl::transform<AudioCodecs, Templatify<Source>>::type>::type VSource;
+typedef std::map<std::string, VSource> Sources;
+Sources g_sources;
 
-template<typename T>
-T get_decoder(Media::PayloadType pt, T const& t) {
-  if(pt == Media::G711A)
-    return Media::decoder<Media::G711aDecoder>(t);
-  else if(pt == Media::G711U)
-    return Media::decoder<Media::G711uDecoder>(t);
+VSource& get_source(JSON::Value const& v) {
+  Sources::iterator i = g_sources.find(boost::get<JSON::String>(v));
+  if(g_sources.end() == i)
+    throw std::range_error("non existing source name " + boost::get<JSON::String>(v));
 
-  throw std::runtime_error("Unknown Decoder");
+  return i->second;
 }
 
 template<typename T>
-T get_encoder(Media::PayloadType pt, T const& t) {
-  if(pt == Media::G711A)
-    return Media::encoder<Media::G711aEncoder>(t);
-  else if(pt == Media::G711U)
-    return Media::encoder<Media::G711uEncoder>(t);
-
-  throw std::runtime_error("Unknown Encoder");
+Source<T>& insert_source(JSON::Value const& v) {
+  return boost::get<Source<T>>(g_sources.insert(std::make_pair(boost::get<JSON::String>(v), Source<T>())).first->second);
 }
 
-Media::PayloadType get_payload_type(std::string const& name) {
-  for(size_t i = 0; i != sizeof(Media::Payloads)/sizeof(*Media::Payloads); ++i)
-    if(name == Media::Payloads[i]->name())
-      return Media::Payloads[i];
-
-  throw std::runtime_error("unknown codec");
+template<typename T, typename S>
+Source<T>& set_source(JSON::Value const& v, S const& s) {
+  Source<T>& t = insert_source<T>(v);
+  *t.p_ = Media::Audio::PullSplitter<S>(s);
+  return t;
 }
 
-Media::Source get_source(JSON::Value& v) {
-  if(boost::get<JSON::String>(&v)) {
-    ResourceMap::iterator i = g_resource_map.find(boost::get<JSON::String>(v));
 
-    if(i == g_resource_map.end() || i->second.pull_source_.empty())
-      throw std::runtime_error("not a pull source");
+typedef std::map<std::string, boost::any> Objects;
+Objects g_objects;
 
-    return i->second.pull_source_;
+
+struct make_jitter_buffer {
+  template<typename T>
+  void operator()(JSON::Value const& name, T*) {
+    auto buffer = boost::make_shared<Media::Audio::JitterBuffer<T> >();
+
+    set_sink<Media::Audio::Packet<T>>(name, boost::bind(&Media::Audio::JitterBuffer<T>::push, buffer, _1));
+    set_source<T>(name, boost::bind(&Media::Audio::JitterBuffer<T>::pull, buffer));
   }
-  else if(boost::get<JSON::Object>(&v)) {
-    JSON::Object& m = boost::get<JSON::Object>(v);
-    if(!(m["decode"] == JSON::null)) 
-      return get_decoder(get_payload_type(boost::get<JSON::String>(m["codec"])), get_source(m["decode"]));
-    else if(!(m["encode"] == JSON::null)) 
-      return get_encoder(get_payload_type(boost::get<JSON::String>(m["codec"])), get_source(m["encode"]));
-    else 
-      throw std::runtime_error("Unsupported Transformation");
-  }
-  else if(boost::get<JSON::Array>(&v)) {
-    JSON::Array a;
-    if(a.size() == 0)
-      return Media::Source();
+};
 
-    Media::Source s = get_source(a[0]);
-
-    for(size_t i = 1; i != a.size(); ++i)
-      s = Media::mix2(s, get_source(a[i]));
-
-    return s;
-  }
-  else
-    throw std::runtime_error("source can be source id or transformation object");
+JSON::Value create_jitter_buffer(JSON::Array& array) {
+  for_codec_name(boost::get<JSON::String>(array[0]), boost::bind<void>(make_jitter_buffer(), array[1], _1));
+  return JSON::null;
 }
 
-Media::Sink get_sink(JSON::Value& v) {
-  if(boost::get<JSON::String>(&v)) {
-    ResourceMap::iterator i = g_resource_map.find(boost::get<JSON::String>(v));
 
-    if(i == g_resource_map.end() || i->second.push_sink_.empty())
-      throw std::runtime_error("not a push sink");
-
-    return i->second.push_sink_;
+struct make_clock {
+  typedef boost::any result_type;
+  template<typename T>
+  boost::any operator()(Source<T> const& source, Sink<T> const& sink) const {
+    return Media::Audio::clock(source.branch(), sink);
   }
-  else if(boost::get<JSON::Object>(&v)) {
-    JSON::Object& m = boost::get<JSON::Object>(v);
-    if(!(m["decode"] == JSON::null))
-      return get_decoder(get_payload_type(boost::get<JSON::String>(m["codec"])), get_sink(m["decode"]));
-    else if(!(m["encode"] == JSON::null))
-      return get_encoder(get_payload_type(boost::get<JSON::String>(m["codec"])), get_sink(m["encode"]));
-    else 
-      throw std::runtime_error("Unsupported Transformation");
+
+  template<typename T1, typename T2>
+  boost::any operator()(T1, T2) const { throw std::runtime_error("type error"); }
+};
+
+JSON::Value create_clock(JSON::Array& array) {
+  std::string name = boost::get<JSON::String>(array[0]);
+  g_objects[name] = boost::apply_visitor(make_clock(),get_source(array[1]),  get_sink(array[2]));
+  return JSON::null;
+}
+
+
+struct Unidecode {
+  template<typename T>
+  void operator()(T const& t) {
+    if(&push_.type() != &typeid(boost::shared_ptr<Media::Audio::JitterBuffer<T> >)) {
+      boost::shared_ptr<Media::Audio::JitterBuffer<T> > buffer = boost::make_shared<Media::Audio::JitterBuffer<T> >();
+      pull_ = Media::Audio::resize<80>(decode(boost::bind(&Media::Audio::JitterBuffer<T>::pull, buffer)));
+      push_ = buffer;
+    }
+    
+    boost::any_cast<boost::shared_ptr<Media::Audio::JitterBuffer<T> > >(push_)->push(t);
   }
-  else if(boost::get<JSON::Array>(&v)) {
-    JSON::Array a;
-    if(a.size() == 0)
-      throw std::runtime_error("splitter can't have empty sink list");
 
-    Media::Sink s = get_sink(a[0]);
+  Media::Audio::LinearFrame<80> operator()() {
+    return pull_();
+  }
 
-    for(size_t i = 1; i != a.size(); ++i)
-      s = Media::split2(s, get_sink(a[i]));
+  boost::any push_;
+  boost::function<Media::Audio::LinearFrame<80> ()> pull_;
+};
 
-    return s;
+struct make_decode {
+  template<typename T>
+  void operator()(JSON::Value const& name, Source<T> const& t) const {
+    using namespace Media::Audio;
+    set_source<LinearFrame<80>>(name, resize<80>(decode(t.branch())));
+  }
+
+  void operator()(JSON::Value const&, Source<Media::Audio::LinearFrame<80> > const&) const {
+    throw std::runtime_error("can't decode linear");
+  }
+};
+
+void decode(JSON::Array& array) {
+  boost::apply_visitor(boost::bind<void>(make_decode(), array[0], _1), get_source(array[1]));
+}
+
+
+struct make_encode {
+  template<typename T>
+  void operator()(JSON::Value const& from, JSON::Value const& to, T*) const {
+    using namespace Media::Audio;
+    set_source<T>(to, encode<T>(resize<T::duration>(boost::get<Source<LinearFrame<80>>>(get_source(from)).branch())));
+  }
+
+  void operator()(JSON::Value const&, JSON::Value const&, Media::Audio::LinearFrame<80>*) const {
+    throw std::runtime_error("can't encode linear");
+  }
+};
+
+void encode(JSON::Array& array) {
+  for_codec_name(boost::get<JSON::String>(array[0]), boost::bind<void>(make_encode(), array[1], array[2], _1));
+}
+
+
+struct make_packetize {
+  template<typename T>
+  void operator()(JSON::Value const& name, Sink<T> const& s) const {
+    set_sink<T>(name, Media::Audio::Packetizer<Sink<T> >(s));
+  }
+
+  void operator()(JSON::Value const&, Sink<Media::Transport::UdpPacket> const&) const {
+    throw std::logic_error("type error");
+  }
+
+  void operator()(JSON::Value const&, Sink<Media::Transport::RtpPacket> const&) const {
+    throw std::logic_error("type error");
+  }
+
+  template<typename T>
+  void operator()(JSON::Value const&, Sink<Media::Audio::Packet<T> > const&) const {
+    throw std::logic_error("type error");
+  }
+};
+  
+void packetize(JSON::Array& array) {
+  boost::apply_visitor(boost::bind<void>(make_packetize(), array[1], _1), get_sink(array[0]));
+}
+/*
+struct make_sink {
+  template<typename T>
+  void operator()(JSON::Value const& name, T*) const {
+    set_sink<T>(name, boost::function<void (T const&)>());
+  }
+};
+
+JSON::Value declare_sink(JSON::Array& array) {
+  for_codec_name(boost::get<JSON::String>(array[1]), boost::bind<void>(make_sink(), array[0], _1));  
+  return JSON::null;
+}
+
+
+struct make_source {
+  template<typename T>
+  void operator()(JSON::Value const& name, T*) const {
+    set_source<T>(name, boost::function<T ()>());
+  }
+};
+
+void declare_source(JSON::Array& array) {
+  for_codec_name(boost::get<JSON::String>(array[1]), boost::bind<void>(make_source(), array[0], _1));
+}
+*/
+
+void mix(JSON::Array& array) {
+  using namespace Media::Audio;
+
+  std::vector<decltype(Source<LinearFrame<80>>().branch())> m;
+
+  for(size_t i = 1; i < array.size(); ++i)
+    m.push_back(boost::get<Source<LinearFrame<80>>>(get_source(array[i])).branch());
+  
+  set_source<LinearFrame<80> >(array[0], Mixer<decltype(m)>(m));
+}
+
+
+struct make_splitter {
+  template<typename T>
+  void operator()(JSON::Array& args, Sink<T> const&) const {
+    std::vector<Sink<T>> s;
+    
+    for(size_t i = 0; i < args.size(); ++i) 
+      s.push_back(insert_sink<T>(args[i]));
+    
+    set_sink<T>(args[0], Media::Audio::Splitter<decltype(s)>(s));
+  }
+};
+
+void split(JSON::Array& array) {
+  boost::apply_visitor(boost::bind<void>(make_splitter(), boost::ref(array), _1), get_sink(array[0])); 
+}
+
+
+boost::asio::ip::udp::endpoint endpoint(JSON::Value& v) {
+  JSON::Object& o = boost::get<JSON::Object>(v);
+
+  return boost::asio::ip::udp::endpoint(
+    boost::asio::ip::address::from_string(boost::get<JSON::String>(o["address"])),
+    boost::get<JSON::Number>(o["port"]));
+}
+
+JSON::Value create_socket(JSON::Array& array) {
+  Media::Transport::Socket s;
+
+  s.socket_->open(boost::asio::ip::udp::v4());
+
+  set_sink<Media::Transport::UdpPacket>(array[0], s);
+  s.recv(insert_sink<Media::Transport::UdpPacket>(array[1]));
+
+  if(array.size() >= 4) {
+    s.socket_->bind(endpoint(array[2]));
+    s.socket_->connect(endpoint(array[3]));
   }
   else {
-    throw std::runtime_error("sink can be sink id or transformation object");
+    s.socket_->connect(endpoint(array[2]));
   }
+
+  return JSON::null;
 }
+
+struct make_reader {
+  template<typename T>
+  void operator()(JSON::Value const& name, std::string const& filename, T*) const {
+    int fd = open(filename.c_str(), O_RDONLY);
+    if(-1 == fd)
+      throw std::runtime_error("not found");
+
+    set_source<T>(name, Media::Transport::Reader<T>(fd));
+  }
+};
+
+void create_reader(JSON::Array& array) {
+  for_codec_name(boost::get<JSON::String>(array[2]), boost::bind<void>(make_reader(), array[0], boost::get<JSON::String>(array[1]), _1));
+}
+
+struct make_writer {
+  template<typename T>
+  void operator()(JSON::Value const& name, std::string const& filename, T*) const {
+    int fd = open(filename.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0666);
+    if(-1 == fd)
+      throw std::runtime_error("not found");
+
+    set_sink<T>(name, Media::Transport::Writer<>(fd));
+  }
+};
+
+JSON::Value create_write(JSON::Array& array) {
+  for_codec_name(boost::get<JSON::String>(array[2]), boost::bind<void>(make_writer(), array[0], boost::get<JSON::String>(array[1]), _1));
+  return JSON::null;
+}
+
+
+JSON::Value rtp2packet(JSON::Array& array) {
+  struct make_rtp2packet {
+    template<typename T>
+    void operator()(JSON::Value const& from, JSON::Value const& to, JSON::Value const& pt, T*) {
+      typedef Media::Audio::Packet<T> Packet;
+      using namespace Media::Transport;
+      set_sink<UdpPacket>(from, make_parse<RtpPacket>(rtp2packet<Packet>(boost::get<JSON::Number>(pt),insert_sink<Packet>(to))));
+    }
+  };
+
+  for_codec_name(boost::get<JSON::String>(array[2]), boost::bind<void>(make_rtp2packet(), array[0], array[1], array[3], _1)); 
+  return JSON::null;
+}
+
+/*
+JSON::Value packet2rtp(JSON::Array& array) {
+}
+*/
+JSON::Value destroy(JSON::Array& args) {
+  g_sinks.erase(boost::get<JSON::String>(args[0]));
+  g_sources.erase(boost::get<JSON::String>(args[0]));
+  g_objects.erase(boost::get<JSON::String>(args[0]));
+  return JSON::null;
+}
+
 
 typedef std::map<std::string, boost::function<JSON::Value (JSON::Array& )> > MethodsMap;
 MethodsMap g_methods;
-
-MethodsMap g_constructors;
-
-JSON::Value create(JSON::Array& params) {
-  MethodsMap::iterator i = g_constructors.find(boost::get<JSON::String>(params.at(0)));
-
-  if(i == g_constructors.end())
-    throw std::runtime_error("Unknown Constructor");
-
-  return i->second(params);  
-}
 
 void request(JSON::Object& v) {
   try {
@@ -196,7 +434,8 @@ void request(JSON::Object& v) {
     
     if(!(v["id"] == JSON::null)) {
       std::ostream::sentry sentry(std::cout); 
-      std::cout << "{\"result\":" << i->second(boost::get<JSON::Array>(v["params"])) << ",\"error\":null,\"id\":" << v["id"] << "}" << std::endl;
+      JSON::Value r = i->second(boost::get<JSON::Array>(v["params"]));
+      std::cout << "{\"result\":" << r << ",\"error\":null,\"id\":" << v["id"] << "}" << std::endl;
     }
   }
   catch(std::exception const& e) {
@@ -207,221 +446,26 @@ void request(JSON::Object& v) {
   }
 }
 
-JSON::Value rtp_configure(boost::intrusive_ptr<Media::Rtp> rtp, JSON::Array& v) {
-  JSON::Object& a = boost::get<JSON::Object>(v.at(1));
-
-  JSON::Object::iterator i = a.find("rtpmap");
-  if(i != a.end()) {
-    JSON::Object& rtpmap = boost::get<JSON::Object>(i->second);
-
-    int alaw = boost::get<double>(rtpmap[Media::G711A->name()]);
-    int ulaw = boost::get<double>(rtpmap[Media::G711U->name()]);
-    int te = boost::get<double>(rtpmap[Media::RFC2833->name()]);
-
-    rtp->set_payload_type_to_rtp_type(boost::bind(srtpmap, _1, alaw, ulaw, te));
-    rtp->set_rtp_type_to_payload_type(boost::bind(irtpmap, _1, alaw, ulaw, te));
-  }
-  
-  i = a.find("remote");
-  if(i != a.end()) {
-    JSON::Object& ep = boost::get<JSON::Object>(i->second);
-    rtp->connect(boost::asio::ip::udp::endpoint(boost::asio::ip::address::from_string(boost::get<JSON::String>(ep["address"])), boost::get<double>(ep["port"])));
-  }
-
-  i = a.find("local");
-  if(i != a.end()) {
-    JSON::Object& ep = boost::get<JSON::Object>(i->second);
-    rtp->bind(boost::asio::ip::udp::endpoint(boost::asio::ip::address::from_string(boost::get<JSON::String>(ep["address"])), boost::get<double>(ep["port"])));
-  }
-
-  return JSON::make_object("local",JSON::make_object(
-      "address", rtp->local_endpoint().address().to_string(),
-      "port", double(rtp->local_endpoint().port())));
-}
-
-JSON::Value rtp_create(JSON::Array& v) {
-  static int count = 0;
-
-  Resource r;
-
-  boost::intrusive_ptr<Media::Rtp> rtp = new Media::Rtp(); 
-
-  r.close_ = boost::bind(&Media::Rtp::close, rtp);
-  r.configure_ = boost::bind(rtp_configure, rtp, _1);
-
-  r.push_source_ = boost::bind(&Media::Rtp::set_sink, rtp, _1);
-  r.push_sink_ = Media::make_sink(rtp);
-  
-  r.pull_sink_ = boost::bind(&Media::Rtp::set_source, rtp, _1);
-
-  std::ostringstream id;
-
-  id << "rtp" << count++;
-
-  g_resource_map[id.str()] = r;
-
-  return JSON::Value(id.str());
-}
-
-void fire_filesource_eof(std::string const& id) {
-  std::ostream::sentry s(std::cout);
-
-  std::cout 
-    << JSON::make_object(
-        "method","endOfFile",
-        "params", JSON::make_array(id),
-        "id", JSON::null)
-    << std::endl;
-}
-
-JSON::Value filesource_create(JSON::Array& v) {
-  static int count = 0;
-  Resource r;
-
-  std::ostringstream id;
-  id << "filesource" << count++;
- 
-  boost::intrusive_ptr<Media::FileSource> fsrc = new Media::FileSource(
-    boost::get<JSON::String>(boost::get<JSON::String>(v.at(1))).c_str(),
-    get_payload_type(boost::get<JSON::String>(v.at(2))),
-    wrap_event_callback(boost::bind(fire_filesource_eof, id.str())));
-
-  r.pull_source_ = Media::make_source(fsrc);
-  r.close_ = boost::bind(&Media::FileSource::close, fsrc);
-  
-  g_resource_map[id.str()] = r;
- 
-  return id.str();
-}
-
-JSON::Value filesink_create(JSON::Array& v) {
-  static int count = 0;
-  Resource r;
-
-  boost::intrusive_ptr<Media::FileSink> fsk = new Media::FileSink(boost::get<JSON::String>(v.at(1)).c_str());
-
-  std::ostringstream id;
-  id << "filesink" << count++;
-
-  r.close_ = boost::bind(&Media::FileSink::close, fsk);
-  r.push_sink_ = Media::make_sink(fsk);
-
-  g_resource_map[id.str()] = r;
-
-  return id.str();
-}
-
-void fire_telephony_event(std::string const& id, int e, boost::posix_time::ptime const& time) {
-  std::cout << 
-    JSON::make_object(
-      "method", "telephony-event",
-      "params", JSON::make_array(id, double(e), boost::posix_time::to_simple_string(time)),
-      "id", JSON::null) 
-    << std::endl;
-}
-
-JSON::Value tedetector_create(JSON::Array& v) {
-  static int count = 0;
-  Resource r;
-
-  std::ostringstream id;
-  id << "tedetector" << count++;
-
-  boost::intrusive_ptr<Media::TelephoneEventDetector> ted = new Media::TelephoneEventDetector(wrap_event_callback(boost::bind(fire_telephony_event,id.str(),_1,_2)));
-
-  r.push_sink_ = Media::make_sink(ted);
-
-  g_resource_map[id.str()] = r;
-
-  return id.str();
-}
-
-JSON::Value jitterbuffer_create(JSON::Array& v) {
-  static int count = 0;
-  Resource r;
-
-  std::ostringstream id;
-  id << "jitterbuffer" << count++;
-
-  std::pair<Media::Source,Media::Sink> p = make_jitter_buffer(Media::L16);
-
-  r.push_sink_ = p.second;
-  r.pull_source_ = p.first;
-
-  g_resource_map[id.str()] = r;
-
-  return id.str();
-}
-
-JSON::Value push(JSON::Array& v) {
-  ResourceMap::iterator i = g_resource_map.find(boost::get<JSON::String>(v.at(0)));
-  if(i != g_resource_map.end() && i->second.push_source_)
-    i->second.push_source_(get_sink(v.at(1)));
-  else
-    throw std::runtime_error("not a push source");
-
-  return JSON::null;
-}
-
-JSON::Value pull(JSON::Array& v) { 
-  ResourceMap::iterator i = g_resource_map.find(boost::get<JSON::String>(v.at(0)));
-  if(i != g_resource_map.end() && i->second.pull_sink_)
-    i->second.pull_sink_(get_source(v.at(1)));
-  else
-    throw std::runtime_error("not a pull sink");
-  return JSON::null;
-}
-
-JSON::Value destroy(JSON::Array& v) {
-  ResourceMap::iterator i = g_resource_map.find(boost::get<JSON::String>(v.at(0)));
-  if(i != g_resource_map.end()) {
-    i->second.close_();
-    g_resource_map.erase(i);
-  }
-  else
-    throw std::runtime_error("resource not found");
-  return JSON::null;
-}
-
-JSON::Value configure(JSON::Array& v) {
-  ResourceMap::iterator i = g_resource_map.find(boost::get<JSON::String>(v.at(0)));
-  if(i != g_resource_map.end() && !i->second.configure_.empty())
-    return i->second.configure_(v);
-  else
-    throw std::runtime_error("resource not found");
-}
 
 int main(int argc, char* argv[]) {
-  try {
-    Media::start();
-    boost::asio::io_service::work evwork(the_event_io);
-    start_event_thread();
+  g_methods["delete"] = destroy;
+  g_methods["socket"] = create_socket;
+  g_methods["rtp2packet"] = rtp2packet; 
+  g_methods["write"] = create_write;
+  g_methods["clock"] = create_clock;
+  g_methods["jitter"] = create_jitter_buffer;
 
-    g_methods["create"] = create;
-    g_methods["configure"] = configure;
-    g_methods["push"] = push;
-    g_methods["pull"] = pull;
-    g_methods["destroy"] = destroy;
+  Media::start();  
 
-    g_constructors["rtp"] = rtp_create;
-    g_constructors["filesink"] = filesink_create;
-    g_constructors["filesource"] = filesource_create;
-    g_constructors["tedetector"] = tedetector_create;
-    g_constructors["jitterbuffer"] = jitterbuffer_create;
-
-    std::cout << std::boolalpha;
-
-    while(std::cin) {
-      JSON::Value v = JSON::parse(std::cin);
-      if(!(v == JSON::null))
-        request(boost::get<JSON::Object>(v));
+  while(std::cin) {
+    JSON::Value v = JSON::parse(std::cin);
+    if(!(v == JSON::null)) {
+      request(boost::get<JSON::Object>(v));
     }
-    stop_event_thread();
-    //Media::stop();
   }
-  catch(std::exception const& e) {
-    std::cerr << "Exception occured: " << e.what() << std::endl;
-  }
+
+  Media::stop();
+
   return 0;
 }
 
