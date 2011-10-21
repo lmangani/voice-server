@@ -31,19 +31,19 @@ void Socket::operator()(UdpPacket const& p) {
   socket_->async_send(boost::asio::const_buffers_1(p.data_.get(), p.length_), boost::bind<void>(empty_fun(), p, _1, _2));
 }
 
-bool parse(UdpPacket const& in, RtpPacket & out) {
-  struct RtpHeader {
-    unsigned cc:4;      // CSRC count
-    unsigned x:1;       // extension flag
-    unsigned p:1;       // padding flag
-    unsigned version:2; // RTP version
-    unsigned pt:7;      // payload type
-    unsigned m:1;       // marker
-    unsigned seq:16;    // sequence number
-    boost::uint32_t timestamp;
-    boost::uint32_t ssrc;      // synchronization source
-  };
+struct RtpHeader {
+  unsigned cc:4;      // CSRC count
+  unsigned x:1;       // extension flag
+  unsigned p:1;       // padding flag
+  unsigned version:2; // RTP version
+  unsigned pt:7;      // payload type
+  unsigned m:1;       // marker
+  unsigned seq:16;    // sequence number
+  boost::uint32_t timestamp;
+  boost::uint32_t ssrc;      // synchronization source
+};
 
+bool parse(UdpPacket const& in, RtpPacket & out) {
   if(in.length_ < sizeof(RtpHeader))
     return false;
 
@@ -69,6 +69,33 @@ bool parse(UdpPacket const& in, RtpPacket & out) {
   out.payload_ = boost::shared_ptr<void>(in.data_, reinterpret_cast<boost::uint32_t*>(hdr+1)+hdr->cc);
   out.length_ = in.length_ - offset - padding;
   
+  return true;
+}
+
+struct ArrayDeleter {
+  template<typename T>
+  void operator()(T* t) {
+    delete[] t;
+  }
+};
+
+bool parse(RtpPacket const& in, UdpPacket& out) {
+  boost::shared_ptr<void> p(new char[sizeof(RtpHeader) + in.length_], ArrayDeleter());
+
+  RtpHeader* hdr = reinterpret_cast<RtpHeader*>(p.get());
+  memset(hdr, 0, sizeof(*hdr));
+
+  hdr->pt = in.pt_;
+  hdr->m = in.marker_;
+  hdr->seq = htons(in.seq_);
+  hdr->timestamp = htonl(in.ts_);
+  hdr->ssrc = htonl(in.ssrc_);
+  
+  memcpy(hdr+1, in.payload_.get(), in.length_);
+
+  out.data_ = p;
+  out.length_ = sizeof(*hdr) + in.length_;   
+
   return true;
 }
 

@@ -23,7 +23,7 @@ extern boost::asio::io_service g_io;
 namespace Transport {
 
 struct UdpPacket {
-  UdpPacket(boost::shared_ptr<void> const& p, size_t length) : data_(p), length_(length) {}
+  UdpPacket(boost::shared_ptr<void> const& p = boost::shared_ptr<void>(), size_t length = 0) : data_(p), length_(length) {}
 
   boost::shared_ptr<void> data_;
   size_t length_;
@@ -111,27 +111,30 @@ RtpToPacket<F, A> rtp2packet(boost::uint8_t pt, A const& a) {
   return RtpToPacket<F,A>(pt, a);
 }
 
-template<typename M, typename A>
+template<typename T, typename A>
 struct PacketToRtp {
-  PacketToRtp(M const& m, A const& a) : ssrc_(rand()), m_(m), a_(a) {}
+  PacketToRtp(int pt, A const& a) : ssrc_(rand()), pt_(pt), a_(a) {}
   
-  template<typename T>
   void operator()(T const& t) {
     RtpPacket p;
     p.ssrc_ = ssrc_;
     p.ts_ = t.ts_;
     p.seq_ = t.seq_;
     p.marker_ = t.marker_;
+    p.pt_ = pt_;
 
-    if(-1 != boost::fusion::at_key<T>(m_)) {
-      a_(p);
-    }    
+    a_(p);
   }
 
   boost::uint32_t ssrc_;
-  M m_;
+  boost::uint8_t pt_;
   A a_;
 };
+
+template<typename T, typename A>
+PacketToRtp<T,A> packet2rtp(boost::uint8_t pt, A const& a) {
+  return PacketToRtp<T,A>(pt, a);
+}
 
 template<typename F, typename S = boost::asio::posix::stream_descriptor>
 struct Reader {
@@ -181,9 +184,11 @@ typedef boost::uint32_t Timestamp;
 template<typename Frame>
 struct Packet : Frame {
   Packet() {}
-  Packet(Frame const& f, Timestamp ts) : Frame(f), ts_(ts) {}
+  Packet(Frame const& f, Timestamp ts, boost::uint32_t seq, bool marker) : Frame(f), ts_(ts), seq_(seq), marker_(marker) {}
 
   Timestamp ts_;
+  boost::uint16_t seq_;
+  bool marker_;
 };
 
 
@@ -628,12 +633,15 @@ struct Packetizer {
 
   template<typename T>
   void operator()(T const&  t) {
-    a_(Packet<T>(t, ts_));
+    a_(Packet<T>(t, ts_, seq_, last_frame_was_empty_ && t.data_));
     ts_ += T::duration;
+    last_frame_was_empty_ = !t.data_;
   }
   
   A a_;
   boost::uint32_t ts_;
+  boost::uint32_t seq_ = rand();
+  bool last_frame_was_empty_;
 };
 
 }
