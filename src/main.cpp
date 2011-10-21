@@ -122,7 +122,10 @@ Sink<T>& insert_sink(JSON::Value const& id) {
 template<typename T>
 Sink<T>& set_sink(JSON::Value const& id, boost::function<void (T const&)> const& f) {
   Sink<T>& v = insert_sink<T>(id);
-  *v.p_ = f;
+  
+  typedef boost::function<void (T const&)> F; 
+  Media::post(boost::bind(static_cast<F& (F::*)(F const&)>(&F::operator=), v.p_, f)); // we have to perform assignment in media thread
+  
   return v;
 }
 
@@ -162,7 +165,10 @@ Source<T>& insert_source(JSON::Value const& v) {
 template<typename T, typename S>
 Source<T>& set_source(JSON::Value const& v, S const& s) {
   Source<T>& t = insert_source<T>(v);
-  *t.p_ = Media::Audio::PullSplitter<S>(s);
+  
+  typedef boost::function<std::pair<T,size_t> (size_t)> F;
+  Media::post(boost::bind(static_cast<F& (F::*)(F const&)>(&F::operator=), t.p_, Media::Audio::PullSplitter<S>(s)));
+  
   return t;
 }
 
@@ -279,36 +285,13 @@ struct make_packetize {
   }
 };
   
-void packetize(JSON::Array& array) {
+JSON::Value packetize(JSON::Array& array) {
   boost::apply_visitor(boost::bind<void>(make_packetize(), array[1], _1), get_sink(array[0]));
-}
-/*
-struct make_sink {
-  template<typename T>
-  void operator()(JSON::Value const& name, T*) const {
-    set_sink<T>(name, boost::function<void (T const&)>());
-  }
-};
-
-JSON::Value declare_sink(JSON::Array& array) {
-  for_codec_name(boost::get<JSON::String>(array[1]), boost::bind<void>(make_sink(), array[0], _1));  
   return JSON::null;
 }
 
 
-struct make_source {
-  template<typename T>
-  void operator()(JSON::Value const& name, T*) const {
-    set_source<T>(name, boost::function<T ()>());
-  }
-};
-
-void declare_source(JSON::Array& array) {
-  for_codec_name(boost::get<JSON::String>(array[1]), boost::bind<void>(make_source(), array[0], _1));
-}
-*/
-
-void mix(JSON::Array& array) {
+JSON::Value mix(JSON::Array& array) {
   using namespace Media::Audio;
 
   std::vector<decltype(Source<LinearFrame<80>>().branch())> m;
@@ -317,6 +300,8 @@ void mix(JSON::Array& array) {
     m.push_back(boost::get<Source<LinearFrame<80>>>(get_source(array[i])).branch());
   
   set_source<LinearFrame<80> >(array[0], Mixer<decltype(m)>(m));
+
+  return JSON::null;
 }
 
 
@@ -332,8 +317,9 @@ struct make_splitter {
   }
 };
 
-void split(JSON::Array& array) {
+JSON::Value split(JSON::Array& array) {
   boost::apply_visitor(boost::bind<void>(make_splitter(), boost::ref(array), _1), get_sink(array[0])); 
+  return JSON::null;
 }
 
 
@@ -410,10 +396,21 @@ JSON::Value rtp2packet(JSON::Array& array) {
   return JSON::null;
 }
 
-/*
 JSON::Value packet2rtp(JSON::Array& array) {
+  struct make_packet2rtp {
+    template<typename T>
+    void operator()(JSON::Value const& from, JSON::Value const& to, JSON::Value const& pt, T*) {
+      using namespace Media::Transport;
+      typedef Media::Audio::Packet<T> Packet;
+
+      set_sink<Packet>(from, packet2rtp<Packet>(boost::get<JSON::Number>(pt), make_parse<UdpPacket>(insert_sink<UdpPacket>(to))));
+    }  
+  };
+ 
+  for_codec_name(boost::get<JSON::String>(array[2]), boost::bind<void>(make_packet2rtp(), array[0], array[1], array[3], _1));
+  return JSON::null;
 }
-*/
+
 JSON::Value destroy(JSON::Array& args) {
   g_sinks.erase(boost::get<JSON::String>(args[0]));
   g_sources.erase(boost::get<JSON::String>(args[0]));
@@ -451,10 +448,14 @@ int main(int argc, char* argv[]) {
   g_methods["delete"] = destroy;
   g_methods["socket"] = create_socket;
   g_methods["rtp2packet"] = rtp2packet; 
+  g_methods["packet2rtp"] = packet2rtp;
   g_methods["write"] = create_write;
   g_methods["clock"] = create_clock;
   g_methods["jitter"] = create_jitter_buffer;
-
+  g_methods["packetize"] = packetize;
+  g_methods["mix"] = mix;
+  g_methods["split"] = split;
+  
   Media::start();  
 
   while(std::cin) {
