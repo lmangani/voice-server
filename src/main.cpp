@@ -207,6 +207,15 @@ void request(JSON::Object& v) {
   }
 }
 
+double get_rtpmap_value(JSON::Object& rtpmap, const char* name) {
+  JSON::Object::iterator i = rtpmap.find(name);
+
+  if(rtpmap.end() != i)
+    return boost::get<double>(i->second);
+
+  return -1;
+}
+
 JSON::Value rtp_configure(boost::intrusive_ptr<Media::Rtp> rtp, JSON::Array& v) {
   JSON::Object& a = boost::get<JSON::Object>(v.at(1));
 
@@ -214,9 +223,9 @@ JSON::Value rtp_configure(boost::intrusive_ptr<Media::Rtp> rtp, JSON::Array& v) 
   if(i != a.end()) {
     JSON::Object& rtpmap = boost::get<JSON::Object>(i->second);
 
-    int alaw = boost::get<double>(rtpmap[Media::G711A->name()]);
-    int ulaw = boost::get<double>(rtpmap[Media::G711U->name()]);
-    int te = boost::get<double>(rtpmap[Media::RFC2833->name()]);
+    int alaw = get_rtpmap_value(rtpmap, Media::G711A->name());
+    int ulaw = get_rtpmap_value(rtpmap, Media::G711U->name());
+    int te = get_rtpmap_value(rtpmap, Media::RFC2833->name());
 
     rtp->set_payload_type_to_rtp_type(boost::bind(srtpmap, _1, alaw, ulaw, te));
     rtp->set_rtp_type_to_payload_type(boost::bind(irtpmap, _1, alaw, ulaw, te));
@@ -305,6 +314,33 @@ JSON::Value filesink_create(JSON::Array& v) {
 
   r.close_ = boost::bind(&Media::FileSink::close, fsk);
   r.push_sink_ = Media::make_sink(fsk);
+  r.pull_sink_ = boost::bind(&Media::FileSink::set_source, fsk, _1);
+
+  g_resource_map[id.str()] = r;
+
+  return id.str();
+}
+
+void file_filesocket_connected(std::string const& id, const boost::system::error_code& error) {
+  std::cout << JSON::make_object("method", std::string("filesocket"), "params",
+    JSON::make_array(id, std::string(error ? "error": "connected")), "id", JSON::null) << std::endl;
+}
+
+JSON::Value filesocket_create(JSON::Array& v) {
+  static int count = 0;
+  Resource r;
+
+  std::ostringstream id;
+  id << "filesocket" << count++;
+
+  boost::intrusive_ptr<Media::FileSocket> fsk = new Media::FileSocket(get_payload_type(boost::get<JSON::String>(v.at(2))));
+  fsk->socket_.async_connect(boost::get<JSON::String>(v.at(1)).c_str(), wrap_event_callback(boost::bind(file_filesocket_connected, id.str(), _1)));
+
+  r.close_ = boost::bind(&Media::FileSocket::close, fsk);
+  r.push_sink_ = Media::make_sink(fsk);
+  r.pull_sink_ = boost::bind(&Media::FileSocket::set_source, fsk, _1);
+
+  r.pull_source_ = Media::make_source(fsk);
 
   g_resource_map[id.str()] = r;
 
@@ -343,7 +379,7 @@ JSON::Value jitterbuffer_create(JSON::Array& v) {
   std::ostringstream id;
   id << "jitterbuffer" << count++;
 
-  std::pair<Media::Source,Media::Sink> p = make_jitter_buffer(Media::L16);
+  std::pair<Media::Source,Media::Sink> p = make_jitter_buffer(v.size() > 1 ? get_payload_type(boost::get<JSON::String>(v.at(1))) : Media::L16);
 
   r.push_sink_ = p.second;
   r.pull_source_ = p.first;
@@ -406,6 +442,7 @@ int main(int argc, char* argv[]) {
     g_constructors["rtp"] = rtp_create;
     g_constructors["filesink"] = filesink_create;
     g_constructors["filesource"] = filesource_create;
+    g_constructors["filesocket"] = filesocket_create;
     g_constructors["tedetector"] = tedetector_create;
     g_constructors["jitterbuffer"] = jitterbuffer_create;
 

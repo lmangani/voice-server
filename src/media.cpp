@@ -538,7 +538,7 @@ FileSource::FileSource(const char* file, PayloadType pt, boost::function<void ()
 }
 #else
 FileSource::FileSource(const char* file, PayloadType pt, boost::function<void ()> const& f) : file_(g_file_io), pt_(pt), on_eof_(f) {
-  int fd = open(file, O_RDONLY);
+  int fd = open(file, O_RDWR);
 
   if(-1 == fd) {
     throw boost::system::system_error(boost::system::errc::make_error_code(boost::system::errc::errc_t(errno)));
@@ -677,6 +677,75 @@ void FileSink::close() {
   file_.close();
 }
 
+#ifndef _WINNT_WIN32
+FileSocket::FileSocket(PayloadType pt) : socket_(g_io), pt_(pt) { }
+
+void FileSocket::connect(const char* path) {
+  socket_.connect(asio::local::stream_protocol::endpoint(path));
+}
+
+void FileSocket::set_source(Source const& source) {
+  if(src_puller_) { 
+    src_puller_->stop();
+    src_puller_ = 0;
+  }
+
+  if(!!source) {
+    src_puller_ = new Detail::Puller(source, make_sink(boost::intrusive_ptr<FileSocket>(this)));
+    src_puller_->start();
+  }
+}
+
+void FileSocket::push(PacketPtr const& packet) {
+  asio::async_write(socket_, asio::const_buffers_1(packet->samples(), packet->size()), boost::bind(packet_write_handler, packet, _1, _2));
+}
+
+void FileSocket::on_read_complete(Sink const& sink, PacketPtr const& packet, boost::system::error_code const& ec, size_t bytes) {
+  if(0 == bytes || ec) {
+  }
+  else {
+    packet->size_ = bytes;
+    packet->duration_ = size_to_duration(pt_, bytes);
+
+    sink(packet);
+  }
+}
+
+void FileSocket::set_sink(Sink const& sink) {
+  if(!!sink_puller_) {
+    sink_puller_->stop();
+    sink_puller_ = 0;
+  }
+
+  if(!!sink) {
+    sink_puller_ = new Detail::Puller(make_source(boost::intrusive_ptr<FileSocket>(this)), sink);
+    sink_puller_->start();
+  }
+}
+
+void FileSocket::pull(Sink const& sink) {
+  TimerGuard tg;
+
+  if(ts_.is_special()) {
+    ts_ = posix_time::microsec_clock::universal_time();
+  }
+
+  boost::intrusive_ptr<Packet> packet = make_packet(pt_, ts_);
+  ts_ += packet->duration();
+
+  asio::async_read(socket_, asio::mutable_buffers_1(packet->samples(), packet->size()),
+    boost::bind(&FileSocket::on_read_complete, boost::intrusive_ptr<FileSocket>(this), sink, packet, _1, _2));
+}
+
+void FileSocket::close() {
+  set_sink(Sink());
+  set_source(Source());
+
+  socket_.close();
+}
+
+#endif
+
 void TelephoneEventDetector::push(PacketPtr const& packet) {
   if(packet->payload_type() != RFC2833)
     return;
@@ -741,6 +810,9 @@ void set_realtime_priority() {
   kern_return_t ret = thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&policy, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
 
   assert(KERN_SUCCESS == ret);
+}
+#else
+void set_realtime_priority() {
 }
 #endif
 
