@@ -62,6 +62,11 @@ struct DeVar {
   A a_;
 };
 
+
+typedef std::map<std::string, boost::any> Objects;
+Objects g_objects;
+
+
 template<template<typename T> class S>
 struct Templatify {
   template<typename T>
@@ -102,33 +107,32 @@ typedef boost::make_variant_over<
     Templatify<Sink>>::type
   >::type VSink; 
 
-typedef std::map<std::string, VSink> Sinks;
-Sinks g_sinks;
 
 VSink& get_sink(JSON::Value const& id) {
-  Sinks::iterator i = g_sinks.find(boost::get<JSON::String>(id));
+  Objects::iterator i = g_objects.find(boost::get<JSON::String>(id));
 
-  if(i == g_sinks.end())
+  if(i == g_objects.end())
     throw std::range_error("sink");
 
-  return i->second;
+  return boost::any_cast<VSink&>(i->second);
 }
 
 template<typename T>
 Sink<T>& insert_sink(JSON::Value const& id) {
-  return boost::get<Sink<T> >(g_sinks.insert(std::make_pair(boost::get<JSON::String>(id), Sink<T>())).first->second);
+  return boost::get<Sink<T> >(boost::any_cast<VSink&>(g_objects.insert(std::make_pair(boost::get<JSON::String>(id), Sink<T>())).first->second));
+}
+
+template<typename T>
+Sink<T>& set_sink(Sink<T>& v, boost::function<void (T const&)> const& f) {
+  typedef boost::function<void (T const&)> F;  
+  Media::post(boost::bind(static_cast<F& (F::*)(F const&)>(&F::operator=), v.p_, f)); // we have to perform assignment in media thread
+  return v;
 }
 
 template<typename T>
 Sink<T>& set_sink(JSON::Value const& id, boost::function<void (T const&)> const& f) {
-  Sink<T>& v = insert_sink<T>(id);
-  
-  typedef boost::function<void (T const&)> F; 
-  Media::post(boost::bind(static_cast<F& (F::*)(F const&)>(&F::operator=), v.p_, f)); // we have to perform assignment in media thread
-  
-  return v;
+  return set_sink(insert_sink<T>(id), f);
 }
-
 
 template<typename T>
 struct Source {
@@ -146,20 +150,18 @@ struct Source {
 };
 
 typedef boost::make_variant_over<boost::mpl::transform<AudioCodecs, Templatify<Source>>::type>::type VSource;
-typedef std::map<std::string, VSource> Sources;
-Sources g_sources;
 
 VSource& get_source(JSON::Value const& v) {
-  Sources::iterator i = g_sources.find(boost::get<JSON::String>(v));
-  if(g_sources.end() == i)
+  Objects::iterator i = g_objects.find(boost::get<JSON::String>(v));
+  if(g_objects.end() == i)
     throw std::range_error("non existing source name " + boost::get<JSON::String>(v));
 
-  return i->second;
+  return boost::any_cast<VSource&>(i->second);
 }
 
 template<typename T>
 Source<T>& insert_source(JSON::Value const& v) {
-  return boost::get<Source<T>>(g_sources.insert(std::make_pair(boost::get<JSON::String>(v), Source<T>())).first->second);
+  return boost::get<Source<T>>(boost::any_cast<VSource&>(g_objects.insert(std::make_pair(boost::get<JSON::String>(v), Source<T>())).first->second));
 }
 
 template<typename T, typename S>
@@ -171,10 +173,6 @@ Source<T>& set_source(JSON::Value const& v, S const& s) {
   
   return t;
 }
-
-
-typedef std::map<std::string, boost::any> Objects;
-Objects g_objects;
 
 
 struct make_jitter_buffer {
@@ -411,9 +409,51 @@ JSON::Value packet2rtp(JSON::Array& array) {
   return JSON::null;
 }
 
+
+template<typename T>
+boost::weak_ptr<T> make_weak(boost::shared_ptr<T> const& t) {
+  return boost::weak_ptr<T>(t);
+}
+
+JSON::Value condition(JSON::Array& array) {
+  struct Condition {
+    template<typename T, typename D>
+    void operator()(T const&, boost::weak_ptr<D> const& from, boost::weak_ptr<D> const& to) {
+      boost::shared_ptr<D> f(from), t(to);
+      if(f && t) *t = *f;
+    }
+  };
+
+  struct make_condition {
+    typedef void result_type;
+
+    template<typename T, typename T2>
+    void operator()(Sink<T>& s, Sink<T2> const& from, JSON::Value const& to) const {
+      set_sink(s, boost::function<void (T const&)>(boost::bind<void>(Condition(), _1, make_weak(from.p_), make_weak(insert_sink<T2>(to).p_))));
+    }
+
+    template<typename T, typename T2>
+    void operator()(Sink<T> const& s, Source<T2> const& from, JSON::Value const& to) const {
+      //set_sink(s, boost::bind<void>(Condition(), _1, make_weak(from.p_), make_weak(insert_source<T2>(to).p_)));  
+    }
+  };
+
+  Objects::iterator i = g_objects.find(boost::get<JSON::String>(array[1]));
+
+  if(g_objects.end() == i) throw std::range_error("name not found");
+  if(&i->second.type() == &typeid(VSink)) {
+    boost::apply_visitor(boost::bind(make_condition(), _1, _2, array[2]), get_sink(array[0]), boost::any_cast<VSink&>(i->second));
+  }
+  else if(&i->second.type() == &typeid(VSource)) {
+    boost::apply_visitor(boost::bind(make_condition(), _1, _2, array[2]), get_sink(array[0]), boost::any_cast<VSource const&>(i->second));
+  }
+  else
+    throw std::logic_error("type error");
+
+  return JSON::null;  
+}
+
 JSON::Value destroy(JSON::Array& args) {
-  g_sinks.erase(boost::get<JSON::String>(args[0]));
-  g_sources.erase(boost::get<JSON::String>(args[0]));
   g_objects.erase(boost::get<JSON::String>(args[0]));
   return JSON::null;
 }
@@ -455,7 +495,8 @@ int main(int argc, char* argv[]) {
   g_methods["packetize"] = packetize;
   g_methods["mix"] = mix;
   g_methods["split"] = split;
-  
+  g_methods["condition"] = condition;  
+
   Media::start();  
 
   while(std::cin) {
