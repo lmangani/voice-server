@@ -1,4 +1,6 @@
-#include "media.hpp"
+#include "media_core.hpp"
+#include "media_transport.hpp"
+#include "media_audio.hpp"
 
 #ifdef __MACH__
 #include <mach/mach_init.h>
@@ -13,136 +15,102 @@ extern "C" {
 }
 
 #include <memory>
-
-#include <boost/thread.hpp>
+#include <boost/thread.hpp> // for some reason there are no boost::thread on Mac OS X
 
 namespace Media {
-
-struct empty_fun {
-  template<typename... Args>
-  void operator()(Args... args) {}
-};
 
 boost::asio::io_service g_io;
 
 namespace Transport {
-
-void Socket::operator()(UdpPacket const& p) {
-  socket_->async_send(boost::asio::const_buffers_1(p.data_.get(), p.length_), boost::bind<void>(empty_fun(), p, _1, _2));
-}
-
-struct RtpHeader {
-  unsigned cc:4;      // CSRC count
-  unsigned x:1;       // extension flag
-  unsigned p:1;       // padding flag
-  unsigned version:2; // RTP version
-  unsigned pt:7;      // payload type
-  unsigned m:1;       // marker
-  unsigned seq:16;    // sequence number
-  boost::uint32_t timestamp;
-  boost::uint32_t ssrc;      // synchronization source
-};
-
-bool parse(UdpPacket const& in, RtpPacket & out) {
-  if(in.length_ < sizeof(RtpHeader))
-    return false;
-
-  RtpHeader* hdr = reinterpret_cast<RtpHeader*>(in.data_.get());
-  
-  size_t offset = sizeof(*hdr) + sizeof(boost::uint32_t) * hdr->cc;
-  if(offset > in.length_) return false;
-  
-  if(hdr->x)
-    offset += ntohs(*reinterpret_cast<boost::uint16_t const*>(hdr+1));
-
-  if(offset > in.length_) return false;
-
-  size_t padding = hdr->p ? *(reinterpret_cast<boost::uint8_t const*>(hdr) + in.length_ - 1) : 0;
-
-  if(offset + padding > in.length_) return false;
-
-  out.pt_ = hdr->pt;
-  out.marker_ = hdr->m;
-  out.seq_ = ntohs(hdr->seq);
-  out.ts_ = ntohl(hdr->timestamp);
-  out.ssrc_ = ntohl(hdr->ssrc);
-  out.payload_ = boost::shared_ptr<void>(in.data_, reinterpret_cast<boost::uint32_t*>(hdr+1)+hdr->cc);
-  out.length_ = in.length_ - offset - padding;
-  
-  return true;
-}
-
-struct ArrayDeleter {
-  template<typename T>
-  void operator()(T* t) {
-    delete[] t;
-  }
-};
-
-bool parse(RtpPacket const& in, UdpPacket& out) {
-  boost::shared_ptr<void> p(new char[sizeof(RtpHeader) + in.length_], ArrayDeleter());
-
-  RtpHeader* hdr = reinterpret_cast<RtpHeader*>(p.get());
-  memset(hdr, 0, sizeof(*hdr));
-
-  hdr->pt = in.pt_;
-  hdr->m = in.marker_;
-  hdr->seq = htons(in.seq_);
-  hdr->timestamp = htonl(in.ts_);
-  hdr->ssrc = htonl(in.ssrc_);
-  
-  memcpy(hdr+1, in.payload_.get(), in.length_);
-
-  out.data_ = p;
-  out.length_ = sizeof(*hdr) + in.length_;   
-
-  return true;
-}
-
+boost::asio::io_service g_file_io;
+std::unique_ptr<boost::asio::io_service::work> g_file_work;
+boost::thread g_file_thread;
 }
 
 namespace Audio {
 
-namespace Detail {
-IlbcDecoder::IlbcDecoder(int mode) : state_(boost::make_shared<iLBC_Dec_Inst_t>()) {
-  initDecode(static_cast<iLBC_Dec_Inst_t*>(state_.get()), mode, 1); 
+template<size_t N>
+IlbcDecState<N>& transform(IlbcFrame<N> const& in, LinearFrame<N>& out, IlbcDecState<N>&& state) {
+  float o[N];
+  iLBC_decode(o, in.d_->begin(), reinterpret_cast<iLBC_Dec_Inst_t*>(&state), in.d_ ? 1 : 0);
+
+  mutable_buffers(out);
+  std::copy(o, o + N, out.d_->begin()); 
+
+  return state;
 }
 
-void IlbcDecoder::operator()(boost::uint8_t const* in, boost::int16_t* out) {
-  float data[240];
-  iLBC_decode(data, const_cast<boost::uint8_t*>(in), static_cast<iLBC_Dec_Inst_t*>(state_.get()), (in ? 1 : 0));
+template IlbcDecState<160>& transform(IlbcFrame<160> const&, LinearFrame<160>&, IlbcDecState<160>&&);
+template IlbcDecState<240>& transform(IlbcFrame<240> const&, LinearFrame<240>&, IlbcDecState<240>&&);
 
-  std::copy(data, data + static_cast<iLBC_Dec_Inst_t*>(state_.get())->mode*8, out);    
+template<size_t N>
+IlbcEncState<N>& transform(LinearFrame<N> const& in, IlbcFrame<N>& out, IlbcEncState<N>&& state) {
+  float i[N];
+
+  if(in.d_)
+    std::copy(in.d_->begin(), in.d_->end(), i);
+  else
+    std::fill(i, i + N, 0);  
+
+  iLBC_encode(out.d_->begin(), i, reinterpret_cast<iLBC_Enc_Inst_t*>(&state));
+
+  return state;
 }
 
-IlbcEncoder::IlbcEncoder(int mode) : state_(boost::make_shared<iLBC_Enc_Inst_t>()) {
-  initEncode(static_cast<iLBC_Enc_Inst_t*>(state_.get()), mode); 
-}
-
-void IlbcEncoder::operator()(boost::int16_t const* in, boost::uint8_t* out) {
-  float data[240];
-  std::copy(in, in + static_cast<iLBC_Dec_Inst_t*>(state_.get())->mode*8, data);
-
-  iLBC_encode(out, data, static_cast<iLBC_Enc_Inst_t*>(state_.get()));
-}
+template IlbcEncState<160>& transform(LinearFrame<160> const&, IlbcFrame<160>&, IlbcEncState<160>&&);
+template IlbcEncState<240>& transform(LinearFrame<240> const&, IlbcFrame<240>&, IlbcEncState<240>&&);
 
 }
 
-}
-
-std::auto_ptr<boost::asio::io_service::work> g_work;
+std::unique_ptr<boost::asio::io_service::work> g_work;
 boost::thread g_thread;
 
 
 void start() {
-  g_work = std::auto_ptr<boost::asio::io_service::work>(new boost::asio::io_service::work(g_io));
-  g_thread = boost::thread(boost::bind(static_cast<std::size_t (boost::asio::io_service::*)()>(&boost::asio::io_service::run), boost::ref(g_io)));  
+  Transport::g_file_work = std::unique_ptr<boost::asio::io_service::work>(new boost::asio::io_service::work(Transport::g_file_io));
+  Transport::g_file_thread = []() { Transport::g_file_io.run(); };
+
+
+  g_work = std::unique_ptr<boost::asio::io_service::work>(new boost::asio::io_service::work(g_io));
+  g_thread = [](){ g_io.run(); };  
 }
 
 void stop() {
-  //g_work.reset();
+  Transport::g_file_work = 0;
+  g_work = 0;
 
-  //g_thread.join();
+  g_thread.join();
+  Transport::g_file_thread.join();
+}
+
+void test1() {
+  using namespace Transport;
+  using namespace Audio;
+
+  auto d = SharedFunctor<DelayedSource<std::pair<boost::asio::ip::udp::endpoint,UdpPacket>>>::make();
+  
+  auto r = root(transform_to<RtpPacket>(push(std::move(d), Socket())));
+  
+  auto s1 = root(transform_to<Packet<AlawFrame<160>>>(branch(std::ref(r)), 8));
+  auto s2 = root(transform_to<Packet<AlawFrame<240>>>(branch(std::ref(r)), 8));
+
+  auto s3 = root(rate(jitter(branch(std::ref(s1)))));
+  auto s4 = root(encode<AlawFrame<160>>(resize<160>(resize<80>(decode(jitter(branch(std::ref(s2))))))));
+
+  DelayedSource<AlawFrame<160>> d2;
+
+  condition(branch(std::ref(s1)), [&]{ d2 = branch(std::ref(s3));});
+  condition(branch(std::ref(s2)), [&]{ d2 = branch(std::ref(s4));});
+
+  auto d3 = SharedFunctor<DelayedSource<std::pair<boost::asio::ip::udp::endpoint,UdpPacket>>>::make();
+
+  auto r2 = push(std::move(d3), Socket());
+
+  *(d3.p_) = transform_to<std::pair<boost::asio::ip::udp::endpoint, RtpPacket>>(transform_to<RtpPacket>(transform_to<Packet<AlawFrame<160>>>(std::move(d2)),5),
+    boost::asio::ip::udp::endpoint());
+  
+  Writer w;
+  auto a = push(std::ref(d2), std::move(w));
 }
 
 }
