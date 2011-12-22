@@ -260,6 +260,20 @@ JSON::Value event(JSON::Array& args) {
 }
 
 JSON::Value tag(JSON::Array& args) {
+  using namespace Media::Transport;
+  using namespace Media;
+
+  boost::asio::ip::udp::endpoint ep(boost::asio::ip::address::from_string(boost::get<JSON::String>(args[2])), boost::get<JSON::Number>(args[3]));
+  set_source<std::pair<boost::asio::ip::udp::endpoint, UdpPacket>>(args[0],
+    transform_to<std::pair<boost::asio::ip::udp::endpoint, UdpPacket>>(branch(get_source<UdpPacket>(args[1])), ep));
+
+  return JSON::null;
+}
+
+JSON::Value parse(JSON::Array& args) {
+  using namespace Media::Transport;
+  using namespace Media;
+  set_source<RtpPacket>(args[0], transform_to<RtpPacket>(branch(get_source<UdpPacket>(args[1]))));
   return JSON::null;
 }
 
@@ -372,6 +386,7 @@ int main(int argc, char* argv[]) {
   g_methods["unpack"] = unpack;
   g_methods["condition"] = condition;
   g_methods["tag"] = tag;
+  g_methods["parse"] = parse;
   g_methods["event"] = event;
   g_methods["socket"] = static_cast<JSON::Value (*)(JSON::Array&)>(socket);
   g_methods["reader"] = reader;

@@ -83,6 +83,7 @@ void stop() {
   Transport::g_file_thread.join();
 }
 
+#if 0
 void test1() {
   using namespace Transport;
   using namespace Audio;
@@ -112,6 +113,7 @@ void test1() {
   Writer w;
   auto a = push(std::ref(d2), std::move(w));
 }
+#endif
 
 }
 
