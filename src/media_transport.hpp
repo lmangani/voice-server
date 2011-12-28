@@ -88,6 +88,8 @@ boost::asio::ip::udp::endpoint const& transform(T const& t, std::pair<boost::asi
 
 template<typename F>
 struct Reader {
+  typedef F source_type;
+
   template<typename... Args>
   Reader(Args&&... args) : fd_(g_file_io, std::forward<Args>(args)...) {}
   

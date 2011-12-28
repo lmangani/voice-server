@@ -230,6 +230,8 @@ auto resize(A&& a, typename std::enable_if<M < N>::type* = 0) -> decltype(transf
 
 template<typename A, size_t N = 80>
 struct Mixer {
+  typedef LinearFrame<N> source_type;
+
   Mixer(A && a) : a_(std::forward<A>(a)) {}
  
   template<typename C>

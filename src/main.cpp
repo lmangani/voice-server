@@ -57,9 +57,6 @@ Objects g_objects;
 template<typename T>
 struct Source : Media::SharedFunctor<Media::Root<Media::DelayedSource<T>>> {
   typedef T source_type;
-
-  template<typename... Args>
-  Source(Args&&... args) : Media::SharedFunctor<Media::Root<Media::DelayedSource<T>>>(std::forward<Args>(args)...) {}
   Source() : Media::SharedFunctor<Media::Root<Media::DelayedSource<T>>>(Media::SharedFunctor<Media::Root<Media::DelayedSource<T>>>::make(Media::DelayedSource<T>())) {}
 };
 
@@ -96,13 +93,14 @@ typedef boost::make_variant_over<
 
 template<typename T>
 Source<T> get_source(JSON::Value const& id) {
-  return boost::get<Source<T>>(boost::any_cast<VSource&>(g_objects.insert(std::make_pair(boost::get<JSON::String>(id), Source<T>())).first->second));
+  boost::any& a = g_objects.insert(std::make_pair(boost::get<JSON::String>(id), VSource(Source<T>()))).first->second;
+  return boost::get<Source<T>>(boost::any_cast<VSource>(a));
 }
 
 template<typename T, typename A>
 void set_source(Source<T> v, A&& a) {
   Media::SharedFunctor<A> sa = Media::SharedFunctor<A>::make(std::forward<A>(a));
-  Media::g_io.post([v, sa]() mutable {v.p_->a_ = sa;});
+  Media::g_io.post([v, sa]() mutable { v.p_->a_ = std::move(*sa.p_);});
 }
 
 template<typename T, typename A>
@@ -117,7 +115,6 @@ struct MakeJitter {
     auto to = get_source<T>(args[1]);
     auto from = get_source<Packet<T>>(args[2]);
     Media::g_io.post([=]() mutable { set_source(to,rate(jitter(branch(std::move(from))))); });
-    //Media::g_io.post([=]() mutable { set_source(to, jitter(branch(std::move(from)))); });
   }
 };
 
@@ -143,7 +140,6 @@ JSON::Value decode(JSON::Array& args) {
   for_codec_name(boost::get<JSON::String>(args[0]), std::bind(MakeDecode(), std::ref(args), _1));
   return JSON::null;
 }
-
 
 struct MakeEncode {
   template<typename T>
@@ -229,6 +225,14 @@ struct MakeCondition {
     void operator()(T1 const&, T2 const&) const {}
   };
 
+  struct GetSourceVisitor {
+    typedef VSource result_type;
+    template<typename T>
+    VSource operator()(Source<T> const&, JSON::Value& v) const {
+      return get_source<T>(v);
+    }
+  };
+
   template<typename T>
   void operator()(JSON::Array& args, T*) {
     Objects::iterator i = g_objects.find(boost::get<JSON::String>(args[3]));
@@ -236,17 +240,17 @@ struct MakeCondition {
       throw std::range_error("not found");
 
     VSource f = boost::any_cast<VSource>(i->second);
-
-    i = g_objects.find(boost::get<JSON::String>(args[4]));
-    if(i == g_objects.end())
-      throw std::range_error("not found");
-
-    VSource t = boost::any_cast<VSource>(i->second);
+    VSource t = boost::apply_visitor(std::bind(GetSourceVisitor(), _1, std::ref(args[4])), f);
 
     if(t.which() != f.which())
       throw std::logic_error("incompatible source types");
-    
-    g_objects[boost::get<JSON::String>(args[1])] = condition(branch(get_source<T>(args[2])), [=]{ boost::apply_visitor(Visitor(), f, t);});
+   
+    auto a = std::make_shared<boost::any>();
+    g_objects[boost::get<JSON::String>(args[1])] = a;
+  
+    Source<Media::Audio::Packet<T>> s = get_source<Media::Audio::Packet<T>>(args[2]);
+
+    Media::g_io.post([=]() mutable { *a = move_to_shared(condition(branch(std::move(s)), [=]{ boost::apply_visitor(Visitor(), f, t);}));});
   }
 };
 
@@ -281,8 +285,8 @@ JSON::Value socket(JSON::Array& args) {
   using namespace Media::Transport;
 
   Socket s;
-  //s.s_.open();
-  s.s_.bind(boost::asio::ip::udp::endpoint(boost::asio::ip::address::from_string(boost::get<JSON::String>(args[3])), boost::get<JSON::Number>(args[4])));
+  s.s_.open(boost::asio::ip::udp::v4());
+  s.s_.bind(boost::asio::ip::udp::endpoint(boost::asio::ip::address::from_string(boost::get<JSON::String>(args[2])), boost::get<JSON::Number>(args[3])));
   
   auto sk = get_source<std::pair<boost::asio::ip::udp::endpoint, UdpPacket>>(args[1]);
   auto src = get_source<UdpPacket>(args[0]);

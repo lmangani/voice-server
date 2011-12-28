@@ -60,7 +60,7 @@ struct Nop {
 template<typename T>
 struct SharedFunctor {
   template<typename... Args>
-  auto operator()(Args&&... args) -> decltype((*((T*)0))(std::forward<Args>(args)...)) {
+  auto operator()(Args&&... args) -> decltype((*((T*)0))(std::forward<Args>(args)...)) const {
     return (*p_)(std::forward<Args>(args)...);  
   }
 
@@ -436,6 +436,11 @@ struct DelayedSource {
       (*w_)(std::move(c));
     else
       c_ = std::move(c);
+  }
+
+  template<typename T>
+  void operator()(SharedFunctor<T> const& c) {
+    (*this)(std::function<void (P const&)>(c));
   }
 
   struct Wrapper {
