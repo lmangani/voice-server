@@ -53,7 +53,7 @@ template<typename F>
 int transform(Transport::RtpPacket const& f, std::pair<bool, Packet<F>>& t, int pt = 0) {
   t.first = false;
   if(f.hdr_->pt == pt && f.length_ == sizeof(*t.second.f_.d_)) {
-    t.second.ts_ = f.hdr_->ts;
+    t.second.ts_ = ntohl(f.hdr_->ts);
     typedef decltype(t.second.f_.d_) D;
     t.second.f_.d_ = D(f.data_, static_cast<typename D::element_type*>(f.data_.get()));
     t.first = true;
@@ -77,9 +77,11 @@ RtpFyState&& transform(Packet<F> const& f, Transport::RtpPacket& t, RtpFyState&&
   t.hdr_->version = 2;
   t.hdr_->ssrc = s.ssrc_;
   t.hdr_->pt = s.pt_;
-  t.hdr_->seq = s.seq_;
+  t.hdr_->seq = htons(++s.seq_);
+  t.hdr_->ts = htonl(f.ts_);
 
   t.data_ = f.f_.d_;
+  t.length_ = sizeof(*f.f_.d_);
   
   return std::move(s);
 }
@@ -88,13 +90,17 @@ template<typename F>
 boost::asio::const_buffers_1 const_buffers(F const& f) {
   if(f.d_)
     return boost::asio::const_buffers_1(&(*f.d_), sizeof(*f.d_));
-  return boost::asio::const_buffers_1(0,0);
+  return boost::asio::const_buffers_1(&F::empty_, sizeof(F::empty_));
 }
 
 template<typename Frame>
 boost::asio::mutable_buffers_1 mutable_buffers(Frame& f) {
-  if(!f.d_)
-    f.d_ = std::make_shared<typename std::decay<decltype(*f.d_)>::type>();
+  if(!f.d_) {
+    typedef typename std::decay<decltype(*f.d_)>::type T;
+    static_assert(sizeof(T) >= 80, "sizeofT");
+    f.d_ = std::make_shared<T>();
+  }
+
   return boost::asio::mutable_buffers_1(&(*f.d_), sizeof(*f.d_));
 }
 
@@ -102,19 +108,29 @@ boost::asio::mutable_buffers_1 mutable_buffers(Frame& f) {
 template<size_t N>
 struct LinearFrame {
   std::shared_ptr<std::array<std::int16_t, N>> d_;
+
+  static const std::array<std::int16_t, N> empty_;
 };
+
+template<size_t N>
+const std::array<std::int16_t, N> LinearFrame<N>::empty_ = {{0}};
 
 template<size_t N, size_t M>
 void transform(LinearFrame<N> const& f, std::array<LinearFrame<N/M>, M>& t) {
-  for(size_t i = 0; i != M; ++i)
-    t[i].d_ = std::shared_ptr<std::array<std::int16_t, N/M>>(f.d_, reinterpret_cast<std::array<std::int16_t, N/M>*>(&(*f.d_)[i*N/M]));
+  if(f.d_) {
+    for(size_t i = 0; i != M; ++i)
+      t[i].d_ = std::shared_ptr<std::array<std::int16_t, N/M>>(f.d_, reinterpret_cast<std::array<std::int16_t, N/M>*>(&(*f.d_)[i*N/M]));
+  }
 }
 
 template<size_t N, size_t M>
 void transform(std::array<LinearFrame<N/M>, M> const& f, LinearFrame<N>& t) {
   mutable_buffers(t);
   for(size_t i = 0; i != M; ++i)
-    memcpy(t.d_->begin() + i * N/M, f[i].d_->begin(), sizeof(*f[i].d_));
+    if(f[i].d_)
+      memcpy(t.d_->begin() + i * N/M, f[i].d_->begin(), sizeof(*f[i].d_));
+    else
+      memset(t.d_->begin() + i * N/M, 0, sizeof(*f[i].d_));
 }
 
 template<size_t N>
@@ -127,11 +143,15 @@ LinearFrame<N>& operator += (LinearFrame<N>& a, LinearFrame<N> const& b) {
   return a;
 }
 
+
 template<size_t N>
 struct AlawFrame {
-  static const size_t duration = N;
   std::shared_ptr<std::array<boost::uint8_t, N>> d_;
+  static const std::array<std::uint8_t, N> empty_;
 };
+
+template<size_t N>
+const std::array<std::uint8_t, N> AlawFrame<N>::empty_ = Util::fill_array<uint8_t,N>(0xDD);
 
 template<size_t N>
 void transform(AlawFrame<N> const& f, LinearFrame<N>& t) {
@@ -283,7 +303,7 @@ struct JitterBuffer {
     if(!frames_.empty()) {
       f = frames_.front();
       frames_.pop_front();
-    }  
+    }
 
     return f;
   }
@@ -298,55 +318,26 @@ auto jitter(A&& a) -> decltype(pull(push(std::forward<A>(a), JitterBuffer<F>()))
   return pull(push(std::forward<A>(a), JitterBuffer<F>()));
 }
 
-template<size_t N>
-struct Tick {
-  Tick() : ts_(boost::posix_time::microsec_clock::universal_time()), timer_(g_io) {
-    start();
-  }
-
-  void start() {
-    ts_ +=  boost::posix_time::microseconds(125) * N;
-    timer_.expires_at(ts_);
-    (*this)(std::bind(&Tick<N>::start, this));
-  }
-
-  template<typename C>
-  void operator()(C c) {
-    typedef decltype(c()) x;
-    timer_.async_wait([=](boost::system::error_code const& e) { if(e) c();});
-  }
-
-  boost::posix_time::ptime ts_;
-  boost::asio::deadline_timer timer_;
-
-  static Tick<N>& get() {
-    static Tick<N> t;
-    return t;
-  }
-};
-
-template<size_t N, typename C>
-void next_tick(C&& c) {
-  Tick<N>::get()(std::forward<C>(c));
-}
-
 template<typename A>
 struct Rate {
   typedef typename SourceType<A>::type source_type;
-  Rate(A&& a) : a_(std::make_shared<A>(std::forward<A>(a))) {}
+
+  Rate(A&& a) : a_(std::forward<A>(a)), timer_(g_io) {}
+  Rate(Rate&& r) : a_(std::move(r.a_)), timer_(g_io) {}
 
   template<typename C>
   void operator()(C c) {
-    std::weak_ptr<A> a(a_);
-    next_tick<duration(*(source_type*)(0))>([=] {
-      auto b = a.lock();
-      if(b)
-        (*b)(c);
-      }
-    );
+    if(ts_.is_not_a_date_time())
+      ts_ = boost::posix_time::microsec_clock::universal_time();
+    
+    ts_ += boost::posix_time::microseconds(125)*duration(source_type());
+    timer_.expires_at(ts_);
+    timer_.async_wait([this,c](boost::system::error_code const& e) mutable { if(!e) a_(c);});
   }
 
-  std::shared_ptr<A> a_;
+  A a_;
+  boost::asio::deadline_timer timer_;
+  boost::posix_time::ptime ts_;
 };
 
 template<typename A>

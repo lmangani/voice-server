@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <boost/asio.hpp>
 #include <boost/intrusive/list.hpp>
+#include "util.hpp"
 
 namespace Media {
 
@@ -71,6 +72,8 @@ struct SharedFunctor {
     return t;
   }
 
+  SharedFunctor(std::shared_ptr<T> const& p) : p_(p) {}
+
   std::shared_ptr<T> p_; 
 };
 
@@ -121,10 +124,15 @@ struct SourceType<std::function<void (std::function<void (T const&)> const&)>> {
   typedef T type;
 };
 
+template<typename T>
+struct SourceType<T&> {
+  typedef typename SourceType<T>::type type;
+};
+
 
 template<typename A>
 struct Pull {
-  typedef decltype((*((A*)(0)))()) source_type;
+  typedef typename std::remove_reference<decltype((*((A*)(0)))())>::type source_type;
 
   Pull(A&& a) : a_(std::forward<A>(a)) {}
   Pull(Pull<A>&& p) : a_(std::forward<A>(p.a_)) {}
@@ -132,11 +140,14 @@ struct Pull {
   static_assert(!std::is_same<source_type, void>::value, "wrong source type");
 
   template<typename C>
-  void operator()(C c) {
-    c(a_());
+  inline
+  void operator()(C const& c) {
+    t_ = a_();
+    c(t_);
   }
 
   A a_;
+  source_type t_;
 };
 
 
@@ -155,10 +166,17 @@ struct Push : K {
     start();
   }
 
-  void start() {
+  Push& operator=(Push&& r) {
+    (*static_cast<K*>(this)) = std::move(static_cast<K&&>(r));
+    a_ = std::move(r.a_);
+    start();
+    return *this;
+  }
+
+  void start() throw() {
     a_([this](typename SourceType<A>::type const& f) {
-      (*this)(f);
-      start();
+      this->operator()(f);
+      this->start();
     });
   }
 
@@ -170,34 +188,32 @@ Push<A,K> push(A&& a, K&& k) {
   return Push<A,K>(std::forward<A>(a),std::forward<K>(k));
 }
 
-template<typename A, typename K>
-auto push_pull(A&& a, K&& b) -> decltype(pull(std::bind(std::mem_fn(&Push<A,K>::k_), push(std::forward<A>(a), std::forward<K>(b))))) {
-  return pull(std::bind(std::mem_fn(&Push<A,K>::k_), push(std::forward<A>(a), std::forward<K>(b))));
-}
-
 
 template<typename F>
 struct BranchNode : boost::intrusive::list_base_hook<boost::intrusive::link_mode<boost::intrusive::auto_unlink>> {
   std::function<void (F const& f)> fun_;
 };
 
-template<typename A, typename F = typename A::source_type>
+template<typename A>
 struct Root {
-  typedef F source_type;
-  typedef boost::intrusive::list<BranchNode<F>, boost::intrusive::constant_time_size<false>> Branches;
+  typedef typename SourceType<A>::type source_type;
+  typedef boost::intrusive::list<BranchNode<source_type>, boost::intrusive::constant_time_size<false>> Branches;
 
   Root(A&& a) : a_(std::forward<A>(a)), n_(-1ul), i_(-1ul) {}
   Root(Root&& r) : a_(std::forward<A>(r.a_)), n_(r.n_), i_(r.n_ /*not r._i*/ ) {}
+  Root(Root const& r) : a_(std::move(const_cast<Root&>(r).a_)), n_(-1ul), i_(-1ul) {}
+  Root() {}
+  
   ~Root() {
-    for(BranchNode<F>& b: branches_) 
+    for(BranchNode<source_type>& b: branches_) 
       b.fun_ = nullptr;
   }
 
   template<typename C>
-  void operator()(size_t& i, BranchNode<F>& b, C c) {
-    size_t o = i;
-    i = n_ + 1; 
-   
+  void operator()(size_t* i, BranchNode<source_type>& b, C c) {
+    size_t o = *i;
+    *i = i_ + 1;
+
     if(o == n_) 
       c(f_);
     else {
@@ -206,18 +222,19 @@ struct Root {
  
        if(i_ == n_) { // no pending operation
          ++i_;
-      
 
-        a_([this](F const& f) mutable {
+        a_([this](source_type const& f) mutable {
           f_ = f;
           ++n_;
           assert(n_ == i_);
 
-          for(;!branches_.empty();) {
-            std::function<void (F const& f)> t;
-            std::swap(t, branches_.front().fun_);
-            branches_.pop_front();
-              t(f);
+          Branches brs;
+          swap(brs, branches_);
+          for(;!brs.empty();) {
+            std::function<void (source_type const& f)> t;
+            std::swap(t, brs.front().fun_);
+            brs.pop_front();
+            t(f);
           }
         });
       }
@@ -227,7 +244,7 @@ struct Root {
   A a_;
 
   size_t  n_ /*= -1ul*/;
-  F f_;
+  source_type f_;
 
   size_t i_ /*= -1ul*/;
   Branches branches_;
@@ -246,7 +263,7 @@ struct Branch : BranchNode<F> {
 
   template<typename C>
   void operator()(C c) {
-    root_(i_, *this, c);
+    root_(&i_, *this, c);
   }
 
   Root root_;
@@ -301,7 +318,7 @@ struct Disassemble {
   void operator()(C c) {
     if(state_ == f_.size()) {
       state_ = 1;
-      a_([this, c](F const& f) mutable {
+      a_([this, c](F const& f) {
         f_ = f;
         c(f_[0]);
       });
@@ -331,10 +348,12 @@ struct Transform {
 
   template<typename C>
   void operator()(C c) {
-    a_([=](F const& f) mutable {
+    static_assert(!std::is_reference<S>::value, "S must not be a reference");
+   
+    a_([this, c](F const& f) {
         T t;
         s_ = transform(f, t, std::move(s_));
-        c(t);
+        c(t); 
       });
   }
 
@@ -348,10 +367,11 @@ struct Transform<A, T, void> {
   typedef typename SourceType<A>::type F;
 
   Transform(A&& a) : a_(std::forward<A>(a)) {}
+  Transform(Transform&& t) : a_(std::move(t.a_)) {}
 
   template<typename C>
   void operator()(C c) {
-    a_([=](F const& f) mutable {
+    a_([c](F const& f) {
       T t;
       transform(f, t);
       c(t);
@@ -368,13 +388,14 @@ struct Filter {
 
   Filter(A&& a) : a_(std::forward<A>(a)) {}
 
-  template<typename C>
-  void operator()(C c) {
-    a_([=, this](std::pair<bool, T> const& t) {
+  //template<typename C>
+  void operator()(std::function<void (T const& t)> const& c) {
+    Filter<A, T>* self = this;
+    a_([=](std::pair<bool, T> const& t) {
       if(t.first)
         c(t.second);
       else
-        (*this)(c);
+        (*self)(c);
     });
   }
 
@@ -395,9 +416,24 @@ auto transform_to(A&& a, Args&&... args) -> Filter<Transform<A, std::pair<bool, 
 template<typename A, typename D>
 struct Condition {
   Condition(A&& a, D&& d) : a_(std::forward<A>(a)), d_(std::forward<D>(d)) {
-    a_([this](typename SourceType<A>::type const&) {
-      d_();
-    });
+    a_(std::bind(&Condition<A,D>::pull, this, _1));
+  }
+
+  Condition(Condition&& r) : a_(std::move(r.a_)), d_(std::move(r.d_)) {
+    a_(std::bind(&Condition<A,D>::pull, this, _1));
+  }
+
+
+  Condition& operator=(Condition&& r) {
+    a_ = std::move(r.a_);
+    d_ = std::move(r.d_);
+    a_(std::bind(&Condition<A,D>::pull, this, _1));
+    return *this;
+  }
+
+  void pull(typename SourceType<A>::type const&) {
+    d_();
+    //a_(std::bind(&Condition<A,D>::pull, this, _1))
   }
 
   A a_;
